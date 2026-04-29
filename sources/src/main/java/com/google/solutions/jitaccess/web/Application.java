@@ -270,6 +270,7 @@ public class Application {
   public @NotNull ProposalHandler produceProposalHandler(
     @NotNull TokenSigner tokenSigner,
     @NotNull SecretManagerClient secretManagerClient,
+    @NotNull CloudIdentityGroupsClient groupsClient,
     @NotNull Executor executor
   ) {
     //
@@ -288,16 +289,30 @@ public class Application {
             "SLACK_BOT_TOKEN_SECRET points to an empty secret value");
         }
 
+        //
+        // Build a Firestore client targeting the named database that
+        // wavemm-iam Terraform provisions. We construct it locally rather
+        // than producing a project-wide @Singleton to keep its IAM blast
+        // radius scoped to the Slack code path: only this factory branch,
+        // executed only when the flag is on, ever instantiates it.
+        //
+        var firestore = com.google.cloud.firestore.FirestoreOptions
+          .getDefaultInstance().toBuilder()
+          .setProjectId(runtime.projectId())
+          .setDatabaseId(configuration.slackFirestoreDatabase.get())
+          .setCredentials(runtime.applicationCredentials())
+          .build()
+          .getService();
+
         var slackClient = new SlackClient(botToken, executor, logger);
-        var registry = new SlackMessageRegistry(
-          configuration.slackFirestoreDatabase.get(),
-          executor,
-          logger);
+        var registry = new SlackMessageRegistry(firestore, executor, logger);
+        var groupResolver = new GroupResolver(groupsClient, executor);
 
         return new SlackProposalHandler(
           tokenSigner,
           slackClient,
           registry,
+          groupResolver,
           logger,
           new AbstractProposalHandler.Options(configuration.proposalTimeout),
           new SlackProposalHandler.Options(configuration.notificationTimeZone));
