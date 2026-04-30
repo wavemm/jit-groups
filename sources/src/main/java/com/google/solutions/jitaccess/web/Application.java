@@ -280,7 +280,23 @@ public class Application {
     // upstream factory behaviour below — this is the documented rollback
     // path.
     //
-    if (configuration.isSlackConfigured()) {
+    if (configuration.slackNotificationsEnabled) {
+      //
+      // Operator's intent is clear ("turn Slack on"), so fail loudly if any
+      // companion variable is missing rather than silently falling through
+      // to the SMTP/501 branches. Silent fall-through hides a misconfig
+      // that the operator will only notice when the next MPA request lands
+      // and no DM goes out.
+      //
+      if (configuration.slackBotTokenSecret.isEmpty()
+        || configuration.slackFirestoreDatabase.isEmpty()) {
+        throw new IllegalStateException(
+          "SLACK_NOTIFICATIONS_ENABLED=true requires both SLACK_BOT_TOKEN_SECRET "
+            + "and SLACK_FIRESTORE_DATABASE. Either provide them or set "
+            + "SLACK_NOTIFICATIONS_ENABLED=false to restore the upstream "
+            + "notification path.");
+      }
+
       try {
         var botToken = secretManagerClient.accessSecret(
           configuration.slackBotTokenSecret.get());

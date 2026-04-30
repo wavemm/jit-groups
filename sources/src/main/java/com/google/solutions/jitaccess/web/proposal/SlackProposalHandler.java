@@ -15,7 +15,6 @@ import com.google.solutions.jitaccess.apis.Logger;
 import com.google.solutions.jitaccess.apis.clients.AccessException;
 import com.google.solutions.jitaccess.auth.EndUserId;
 import com.google.solutions.jitaccess.auth.GroupResolver;
-import com.google.solutions.jitaccess.auth.IamPrincipalId;
 import com.google.solutions.jitaccess.auth.PrincipalId;
 import com.google.solutions.jitaccess.catalog.JitGroupContext;
 import com.google.solutions.jitaccess.catalog.Proposal;
@@ -24,12 +23,11 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.net.URI;
-import java.time.Instant;
+import java.security.SecureRandom;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletionException;
 
@@ -83,7 +81,10 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull AbstractProposalHandler.Options baseOptions,
     @NotNull Options slackOptions
   ) {
-    super(tokenSigner, new Random(), baseOptions);
+    // Crypto-random for JWT IDs — these are activation token nonces, must
+    // be unpredictable to prevent enumeration. Matches MailProposalHandler
+    // and DebugProposalHandler.
+    super(tokenSigner, new SecureRandom(), baseOptions);
     this.slackClient = slackClient;
     this.registry = registry;
     this.groupResolver = groupResolver;
@@ -92,21 +93,44 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   }
 
   /**
-   * Expand groups in the recipients set to individuals. Returns sorted
-   * unique emails. Non-user, non-group principals (e.g. service accounts)
-   * are dropped.
+   * Compute the registry fingerprint of a proposal — beneficiary, group,
+   * resolved reviewer emails, and the SHA-256 key derived from those.
+   *
+   * <p>Used by both {@link #onOperationProposed} (where we record the entry)
+   * and {@link #onProposalApproved} (where we look it back up). Computing
+   * it in a single helper avoids drift between the two sides — they must
+   * compute the same key or the lookup misses and siblings don't get
+   * updated.
+   *
+   * <p>Group expansion is intentionally part of the fingerprint: if the
+   * policy ACL names a group, the propose-side and accept-side both pass
+   * through {@link GroupResolver#expand}, ending up with the same flat
+   * email set assuming Cloud Identity returns the same membership for
+   * both calls (which it should within the JWT validity window).
    */
-  private @NotNull List<String> resolveRecipientEmails(
-    @NotNull Set<IamPrincipalId> recipients
+  private @NotNull RegistryFingerprint fingerprint(
+    @NotNull Proposal proposal
   ) throws AccessException {
-    Set<PrincipalId> expanded = this.groupResolver.expand(new HashSet<>(recipients));
-    return expanded.stream()
+    var beneficiary = proposal.user().email;
+    var groupId = proposal.group().toString();
+    Set<PrincipalId> expanded = this.groupResolver.expand(
+      new HashSet<>(proposal.recipients()));
+    var reviewerEmails = expanded.stream()
       .filter(EndUserId.class::isInstance)
       .map(p -> ((EndUserId) p).email)
       .distinct()
       .sorted()
       .toList();
+    var key = SlackMessageRegistry.requestKey(beneficiary, groupId, reviewerEmails);
+    return new RegistryFingerprint(beneficiary, groupId, reviewerEmails, key);
   }
+
+  private record RegistryFingerprint(
+    @NotNull String beneficiary,
+    @NotNull String groupId,
+    @NotNull List<String> reviewerEmails,
+    @NotNull String key
+  ) {}
 
   @Override
   void onOperationProposed(
@@ -115,26 +139,22 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull ProposalHandler.ProposalToken token,
     @NotNull URI actionUri
   ) throws AccessException, IOException {
-    var beneficiary = proposal.user().email;
-    var groupId = operation.group().toString();
-
-    var reviewerEmails = resolveRecipientEmails(proposal.recipients());
-    if (reviewerEmails.isEmpty()) {
+    var fp = fingerprint(proposal);
+    if (fp.reviewerEmails().isEmpty()) {
       throw new IOException(
-        "No qualified reviewers resolved to individual users for " + groupId);
+        "No qualified reviewers resolved to individual users for " + fp.groupId());
     }
 
     var justification = proposal.input().getOrDefault("justification", "");
-    var requestKey = SlackMessageRegistry.requestKey(beneficiary, groupId, reviewerEmails);
 
     var blocks = SlackMessages.reviewRequest(
-      beneficiary,
-      groupId,
+      fp.beneficiary(),
+      fp.groupId(),
       justification,
       token.expiryTime(),
       actionUri,
       this.slackOptions.notificationTimeZone());
-    var fallback = SlackMessages.reviewRequestFallback(beneficiary, groupId);
+    var fallback = SlackMessages.reviewRequestFallback(fp.beneficiary(), fp.groupId());
 
     //
     // Resolve users + post DMs in parallel. Aggregate failures: if at least
@@ -145,7 +165,7 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     var posted = new ArrayList<ReviewerMessage>();
     var failures = new ArrayList<String>();
 
-    for (var email : reviewerEmails) {
+    for (var email : fp.reviewerEmails()) {
       try {
         String userId = this.slackClient.lookupUserByEmail(email).join();
         if (userId == null) {
@@ -167,19 +187,19 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         this.logger.warn(
           "slack.dm.failed",
           "Failed to DM reviewer %s for %s: %s",
-          email, groupId, cause.getMessage());
+          email, fp.groupId(), cause.getMessage());
         failures.add(email);
       }
     }
 
     if (posted.isEmpty()) {
       throw new IOException(
-        "Slack DM delivery failed for every reviewer (" + reviewerEmails.size()
-          + ") on " + groupId);
+        "Slack DM delivery failed for every reviewer (" + fp.reviewerEmails().size()
+          + ") on " + fp.groupId());
     }
 
     try {
-      this.registry.record(requestKey, posted, token.expiryTime()).join();
+      this.registry.record(fp.key(), posted, token.expiryTime()).join();
     }
     catch (CompletionException | RuntimeException e) {
       // Registry write failure is bad — siblings won't update on approval —
@@ -188,14 +208,14 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "slackRegistry.record.failed",
         "Failed to persist Slack message registry for key=%s; sibling "
           + "updates will not fire on approval. requester=%s group=%s",
-        requestKey, beneficiary, groupId, e);
+        fp.key(), fp.beneficiary(), fp.groupId(), e);
     }
 
     this.logger.info(
       "slack.onOperationProposed",
       "Posted %d/%d Slack DMs for %s requesting %s (key=%s, failures=%s)",
-      posted.size(), reviewerEmails.size(), beneficiary, groupId,
-      requestKey, failures);
+      posted.size(), fp.reviewerEmails().size(), fp.beneficiary(), fp.groupId(),
+      fp.key(), failures);
   }
 
   @Override
@@ -203,27 +223,23 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull JitGroupContext.ApprovalOperation operation,
     @NotNull Proposal proposal
   ) throws AccessException, IOException {
-    var beneficiary = proposal.user().email;
-    var groupId = proposal.group().toString();
+    var fp = fingerprint(proposal);
     var approverEmail = operation.user().email;
 
-    var reviewerEmails = resolveRecipientEmails(proposal.recipients());
-    var requestKey = SlackMessageRegistry.requestKey(beneficiary, groupId, reviewerEmails);
-
-    var entriesOpt = this.registry.lookup(requestKey).join();
+    var entriesOpt = this.registry.lookup(fp.key()).join();
     if (entriesOpt.isEmpty()) {
       this.logger.warn(
         "slackRegistry.lookup.miss",
         "No Slack registry entry for approved request key=%s; siblings "
           + "won't be updated. requester=%s group=%s approver=%s",
-        requestKey, beneficiary, groupId, approverEmail);
+        fp.key(), fp.beneficiary(), fp.groupId(), approverEmail);
       // Still notify the beneficiary directly.
-      notifyBeneficiary(beneficiary, groupId, approverEmail);
+      notifyBeneficiary(fp.beneficiary(), fp.groupId(), approverEmail);
       return;
     }
 
     var siblingBlocks = SlackMessages.reviewerSiblingUpdate(
-      beneficiary, groupId, approverEmail);
+      fp.beneficiary(), fp.groupId(), approverEmail);
     var siblingFallback = SlackMessages.reviewerSiblingUpdateFallback(approverEmail);
 
     for (var entry : entriesOpt.get()) {
@@ -244,10 +260,10 @@ public class SlackProposalHandler extends AbstractProposalHandler {
       }
     }
 
-    notifyBeneficiary(beneficiary, groupId, approverEmail);
+    notifyBeneficiary(fp.beneficiary(), fp.groupId(), approverEmail);
 
     try {
-      this.registry.delete(requestKey).join();
+      this.registry.delete(fp.key()).join();
     }
     catch (CompletionException | RuntimeException e) {
       // Best-effort; TTL will reap.
@@ -256,7 +272,7 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     this.logger.info(
       "slack.onProposalApproved",
       "Updated %d sibling DM(s) for approved request key=%s (approver=%s)",
-      Math.max(0, entriesOpt.get().size() - 1), requestKey, approverEmail);
+      Math.max(0, entriesOpt.get().size() - 1), fp.key(), approverEmail);
   }
 
   private void notifyBeneficiary(
