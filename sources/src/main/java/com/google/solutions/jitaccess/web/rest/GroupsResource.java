@@ -23,16 +23,22 @@ package com.google.solutions.jitaccess.web.rest;
 
 import com.google.solutions.jitaccess.apis.Logger;
 import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
+import com.google.solutions.jitaccess.apis.clients.CloudIdentityGroupsClient;
+import com.google.solutions.jitaccess.auth.EndUserId;
+import com.google.solutions.jitaccess.auth.GroupResolver;
 import com.google.solutions.jitaccess.auth.JitGroupId;
 import com.google.solutions.jitaccess.auth.Principal;
+import com.google.solutions.jitaccess.auth.Subject;
 import com.google.solutions.jitaccess.catalog.Catalog;
 import com.google.solutions.jitaccess.catalog.JitGroupContext;
 import com.google.solutions.jitaccess.catalog.policy.PolicyAnalysis;
+import com.google.solutions.jitaccess.catalog.policy.PolicyPermission;
 import com.google.solutions.jitaccess.catalog.policy.Privilege;
 import com.google.solutions.jitaccess.catalog.policy.Property;
 import com.google.solutions.jitaccess.common.Coalesce;
 import com.google.solutions.jitaccess.web.*;
 import com.google.solutions.jitaccess.web.proposal.ProposalHandler;
+import com.google.solutions.jitaccess.web.proposal.ReviewerCandidates;
 import com.google.solutions.jitaccess.web.proposal.TokenObfuscator;
 import jakarta.enterprise.context.Dependent;
 import jakarta.inject.Inject;
@@ -44,11 +50,17 @@ import jakarta.ws.rs.core.UriInfo;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 @Dependent
 @Path("/api")
@@ -79,6 +91,18 @@ public class GroupsResource {
   @Inject
   Consoles consoles;
 
+  @Inject
+  Options options;
+
+  @Inject
+  CloudIdentityGroupsClient groupsClient;
+
+  @Inject
+  Subject subject;
+
+  @Inject
+  Executor executor;
+
   /**
    * Get group details, including information about requirements
    * to join the group.
@@ -98,7 +122,7 @@ public class GroupsResource {
         .group(groupId)
         .map(grp -> GroupInfo.create(
           grp,
-          JoinInfo.forJoinAnalysis(grp)))
+          JoinInfo.forJoinAnalysis(grp, this.options.slackCopyLinkEnabled())))
         .orElseThrow(() -> NOT_FOUND);
     }
     catch (Exception e) {
@@ -106,6 +130,13 @@ public class GroupsResource {
       throw (Exception)e.fillInStackTrace();
     }
   }
+
+  // Form field names reserved for the picker UX. These are extracted
+  // from the request body before the rest is forwarded to the constraint
+  // inputs, so a constraint named `selectedReviewers` (improbable, but
+  // we reserve the namespace) wouldn't collide.
+  static final String FIELD_SELECTED_REVIEWERS = "selectedReviewers";
+  static final String FIELD_NOTIFY_REVIEWERS = "notifyReviewers";
 
   /**
    * Attempt to join the group.
@@ -129,6 +160,48 @@ public class GroupsResource {
         .orElseThrow(() -> NOT_FOUND);
 
       //
+      // Pop the picker UX form fields out of inputValues before the
+      // remaining constraint inputs are forwarded to the join op.
+      //
+      var selectedReviewers = parseSelectedReviewers(
+        inputValues.remove(FIELD_SELECTED_REVIEWERS));
+      var notifyReviewers = parseNotifyReviewers(
+        inputValues.remove(FIELD_NOTIFY_REVIEWERS));
+
+      //
+      // When the requester picked specific reviewers, validate every
+      // email is in the expanded qualified-peer set BEFORE calling
+      // propose. JoinOperation.propose trusts the filter is already
+      // an authorised subset (it short-circuits the recipients list
+      // to whatever we pass), so the security check needs to happen
+      // here where we have a GroupResolver to expand groups.
+      //
+      if (selectedReviewers != null && !selectedReviewers.isEmpty()) {
+        var qualified = group.policy().effectiveAccessControlList()
+          .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
+          .stream()
+          .filter(p -> !p.equals(this.subject.user()))
+          .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
+          .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
+          .collect(Collectors.toCollection(HashSet::new));
+        var resolver = new GroupResolver(this.groupsClient, this.executor);
+        var allowedEmails = new ReviewerCandidates(resolver, this.groupsClient, this.executor)
+          .compute(this.subject.user(), qualified)
+          .stream()
+          .map(c -> c.email().toLowerCase())
+          .collect(Collectors.toSet());
+        var rejected = selectedReviewers.stream()
+          .map(EndUserId::value)
+          .filter(e -> !allowedEmails.contains(e.toLowerCase()))
+          .toList();
+        if (!rejected.isEmpty()) {
+          throw new AccessDeniedException(
+            "Selected reviewers are not authorised to approve this request: "
+              + String.join(", ", rejected));
+        }
+      }
+
+      //
       // Attempt to join.
       //
       var joinOp = group.join();
@@ -146,21 +219,38 @@ public class GroupsResource {
         //     the frontend then translates this into making the right
         //     API call.
         //
+        Function<String, URI> buildActionUri = token -> this.linkBuilder
+          .absoluteUriBuilder(this.uriInfo)
+          .path("/")
+          .queryParam("f", String.format(
+            "/environments/%s/proposal/%s",
+            environment, TokenObfuscator.encode(token)))
+          .build();
+
         var proposal = this.proposalHandler.propose(
           joinOp,
-          token -> this.linkBuilder
-            .absoluteUriBuilder(this.uriInfo)
-            .path("/")
-            .queryParam("f", String.format(
-              "/environments/%s/proposal/%s",
-              environment, TokenObfuscator.encode(token)))
-            .build());
+          buildActionUri,
+          new ProposalHandler.ProposeOptions(
+            selectedReviewers,
+            notifyReviewers));
 
         this.auditTrail.joinProposed(joinOp, proposal);
 
+        // Surface the approval URL to the requester only when copy-link
+        // mode is enabled — it lets them paste it manually elsewhere.
+        // When the mode is off the URL is still computed (via
+        // buildActionUri) but never returned, matching the upstream
+        // contract where the URL is only seen by reviewers.
+        var approvalUrl = this.options.slackCopyLinkEnabled()
+          ? buildActionUri.apply(proposal.value()).toString()
+          : null;
+
         return GroupInfo.create(
           group,
-          JoinInfo.forProposal(joinOp.input()));
+          JoinInfo.forProposal(
+            joinOp.input(),
+            approvalUrl,
+            this.options.slackCopyLinkEnabled()));
       }
       else {
         //
@@ -181,6 +271,116 @@ public class GroupsResource {
     catch (Exception e) {
       this.logger.warn(EventIds.API_JOIN_GROUP, e);
       throw (Exception)e.fillInStackTrace();
+    }
+  }
+
+  /**
+   * Cap on the number of selected reviewers a single picker submission
+   * can carry. Sane upper bound — ACLs that grant APPROVE_OTHERS to
+   * groups larger than this number still pass through the legacy "DM
+   * everyone" path because the picker can't fit them all on screen
+   * anyway.
+   */
+  static final int SELECTED_REVIEWERS_MAX = 50;
+
+  /**
+   * Parse the {@code selectedReviewers} multi-value form field into a
+   * {@code Set<EndUserId>}. Empty/missing → null (no filter, default
+   * behaviour). Bounded at {@link #SELECTED_REVIEWERS_MAX} to keep a
+   * hostile client from forcing arbitrary memory and Cloud Identity
+   * lookups; values without an {@code @} are rejected so we don't end
+   * up constructing meaningless {@code EndUserId}s.
+   */
+  private static @Nullable Set<EndUserId> parseSelectedReviewers(
+    @Nullable List<String> raw
+  ) {
+    if (raw == null || raw.isEmpty()) {
+      return null;
+    }
+    if (raw.size() > SELECTED_REVIEWERS_MAX) {
+      throw new BadRequestException(
+        "Too many reviewer selections (got " + raw.size()
+          + ", max " + SELECTED_REVIEWERS_MAX + ")");
+    }
+    var parsed = raw.stream()
+      .filter(s -> s != null && !s.isBlank())
+      .map(String::trim)
+      .filter(s -> s.contains("@"))
+      .map(EndUserId::new)
+      .collect(Collectors.toSet());
+    return parsed.isEmpty() ? null : parsed;
+  }
+
+  private static boolean parseNotifyReviewers(@Nullable List<String> raw) {
+    if (raw == null || raw.isEmpty()) {
+      return true;
+    }
+    // Last value wins (browsers may submit duplicates from a checkbox).
+    return Boolean.parseBoolean(raw.get(raw.size() - 1));
+  }
+
+  /**
+   * List candidate reviewers for the picker UX (wavemm fork). Returns
+   * the qualified peers from the policy ACL (after group expansion),
+   * with a {@code suggested} flag for those who share an approver group
+   * with the requester — i.e. likely-teammates.
+   */
+  @GET
+  @Produces(MediaType.APPLICATION_JSON)
+  @Path("environments/{environment}/systems/{system}/groups/{name}/reviewers")
+  public @NotNull ReviewersInfo getReviewers(
+    @PathParam("environment") @NotNull String environment,
+    @PathParam("system") @NotNull String system,
+    @PathParam("name") @NotNull String name
+  ) throws Exception {
+    try {
+      var groupId = new JitGroupId(environment, system, name);
+      var group = this.catalog
+        .group(groupId)
+        .orElseThrow(() -> NOT_FOUND);
+
+      // Compute the qualified peers the same way JoinOperation.propose
+      // does — union of principals with APPROVE_OTHERS, minus the
+      // requester (filtered at principal level here; ReviewerCandidates
+      // also filters at email level after group expansion).
+      var requester = this.subject.user();
+      var qualified = group.policy().effectiveAccessControlList()
+        .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
+        .stream()
+        .filter(p -> !p.equals(requester))
+        .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
+        .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
+        .collect(Collectors.toCollection(HashSet::new));
+
+      var resolver = new GroupResolver(this.groupsClient, this.executor);
+      var helper = new ReviewerCandidates(resolver, this.groupsClient, this.executor);
+
+      List<ReviewerCandidates.Candidate> candidates;
+      try {
+        candidates = helper.compute(requester, qualified);
+      }
+      catch (com.google.solutions.jitaccess.apis.clients.AccessException
+        | java.io.IOException e) {
+        // Picker is best-effort: a Cloud Identity outage or a missing
+        // group-membership permission must not block the elevation
+        // request. Return the degraded shape and let the frontend
+        // render an explicit notice.
+        this.logger.warn(
+          EventIds.API_VIEW_GROUPS,
+          "Reviewer suggestions degraded for %s on %s: %s",
+          requester.email, groupId, e);
+        return new ReviewersInfo(List.of(), true);
+      }
+
+      return new ReviewersInfo(
+        candidates.stream()
+          .map(c -> new CandidateInfo(c.email(), c.displayName(), c.suggested()))
+          .toList(),
+        false);
+    }
+    catch (Exception e) {
+      this.logger.warn(EventIds.API_VIEW_GROUPS, e);
+      throw (Exception) e.fillInStackTrace();
     }
   }
 
@@ -300,10 +500,19 @@ public class GroupsResource {
     @NotNull MembershipInfo membership,
     @NotNull List<ConstraintInfo> satisfiedConstraints,
     @NotNull List<ConstraintInfo> unsatisfiedConstraints,
-    @NotNull List<InputInfo> input
+    @NotNull List<InputInfo> input,
+    /** JWT-bearing approval URL — non-null only when status is
+     *  JOIN_PROPOSED and SLACK_COPY_LINK_ENABLED is on, so the requester
+     *  can copy/share it manually. */
+    @Nullable String approvalUrl,
+    /** Mirrors the SLACK_COPY_LINK_ENABLED env flag. The picker UI uses
+     *  this to decide whether to render the "Notify reviewers in Slack"
+     *  checkbox and the copy-approval-link affordance. */
+    boolean copyLinkEnabled
   ) {
     static @NotNull GroupsResource.JoinInfo forJoinAnalysis(
-      @NotNull JitGroupContext g
+      @NotNull JitGroupContext g,
+      boolean copyLinkEnabled
     ) {
       var joinOp = g.join();
       var analysis = joinOp.dryRun();
@@ -338,7 +547,9 @@ public class GroupsResource {
         analysis.input().stream()
           .sorted(Comparator.comparing(p -> p.name()))
           .map(InputInfo::fromProperty)
-          .toList());
+          .toList(),
+        null,
+        copyLinkEnabled);
     }
 
     static @NotNull GroupsResource.JoinInfo forCompletedJoin(
@@ -358,11 +569,21 @@ public class GroupsResource {
           .stream()
           .sorted(Comparator.comparing(p -> p.name()))
           .map(InputInfo::fromProperty)
-          .toList());
+          .toList(),
+        null,
+        false);
     }
 
     static @NotNull GroupsResource.JoinInfo forProposal(
       @NotNull List<Property> input
+    ) {
+      return forProposal(input, null, false);
+    }
+
+    static @NotNull GroupsResource.JoinInfo forProposal(
+      @NotNull List<Property> input,
+      @Nullable String approvalUrl,
+      boolean copyLinkEnabled
     ) {
       return new JoinInfo(
         JoinStatusInfo.JOIN_PROPOSED,
@@ -373,9 +594,51 @@ public class GroupsResource {
           .stream()
           .sorted(Comparator.comparing(p -> p.name()))
           .map(InputInfo::fromProperty)
-          .toList());
+          .toList(),
+        approvalUrl,
+        copyLinkEnabled);
     }
   }
+
+  /**
+   * Configuration for this resource. Produced as a CDI singleton in
+   * {@code Application.java} from the corresponding
+   * {@link ApplicationConfiguration} fields.
+   */
+  public record Options(
+    boolean slackCopyLinkEnabled
+  ) {}
+
+  /**
+   * Response payload of {@code GET /reviewers}.
+   *
+   * <p>{@code degraded} means the candidates list is unavailable (Cloud
+   * Identity Groups API was down or the JIT SA was missing a
+   * permission on a group). The frontend uses this to render an
+   * explicit "Reviewer suggestions unavailable" notice instead of
+   * silently submitting with an empty selection.
+   *
+   * <p>The 200 + {@code degraded: true} contract is preferred over a
+   * 500 because the picker is best-effort: a failed peer lookup must
+   * not block the elevation request itself.
+   *
+   * <p>Not a {@link MediaInfo} — it's a sub-resource of the group, the
+   * frontend requests it explicitly and doesn't dispatch on {@code _type}.
+   */
+  public record ReviewersInfo(
+    @NotNull List<CandidateInfo> candidates,
+    boolean degraded
+  ) {}
+
+  /**
+   * One picker candidate. {@code suggested} marks teammates the
+   * requester shares an approver group with — the UI highlights these.
+   */
+  public record CandidateInfo(
+    @NotNull String email,
+    @NotNull String displayName,
+    boolean suggested
+  ) {}
 
   public record ExternalLinkInfo(
     @NotNull Link self,

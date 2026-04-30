@@ -189,53 +189,112 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     var fallback = SlackMessages.reviewRequestFallback(fp.beneficiary(), fp.groupId());
 
     //
-    // Resolve users + post DMs in parallel. Aggregate failures: if at least
-    // one DM lands, the approval flow is viable, so we record the
-    // successful subset and warn on the rest. If zero land, we throw —
-    // the requester needs to know nobody got the message.
+    // Resolve users + post DMs in parallel. Per-reviewer the work is two
+    // sequential Slack calls (lookupByEmail → conversations.open +
+    // chat.postMessage), but the per-reviewer chains run concurrently so
+    // total wallclock latency is one round-trip pair rather than N. Each
+    // chain produces an Optional<ReviewerMessage>: empty when the user
+    // is not in the workspace, populated when DM landed. Failures end up
+    // as exceptionally-completed futures we sweep up with .handle().
     //
-    var posted = new ArrayList<ReviewerMessage>();
-    var failures = new ArrayList<String>();
+    //
+    // Per-reviewer outcome enum so the post-loop can distinguish three
+    // failure modes that the upstream lump-everything error didn't:
+    //   POSTED        — DM landed
+    //   NOT_IN_SLACK  — users.lookupByEmail returned null (not an
+    //                   error; the email simply isn't a Slack workspace
+    //                   member). Common for external-collaborator
+    //                   policies; not worth alarming on.
+    //   API_FAILURE   — an exception bubbled out of either Slack call.
+    //                   Typical: invalid token, missing scope, 5xx.
+    //                   Worth alerting on.
+    // Tracking these separately means the "all failed" error message
+    // tells the operator whether to fix Slack config or fix the policy.
+    //
+    var perReviewerFutures = fp.reviewerEmails().stream()
+      .map(email -> this.slackClient.lookupUserByEmail(email)
+        .thenCompose(userId -> {
+          if (userId == null) {
+            this.logger.warn(
+              "slack.lookupByEmail.notFound",
+              "Reviewer %s is not in the Slack workspace; skipping",
+              email);
+            return java.util.concurrent.CompletableFuture.completedFuture(
+              new DmOutcome(email, null, ReviewerOutcome.NOT_IN_SLACK));
+          }
+          return this.slackClient.postDirectMessage(userId, blocks, fallback)
+            .thenApply(msg -> new DmOutcome(
+              email,
+              new ReviewerMessage(email, userId, msg.channelId(), msg.messageTs()),
+              ReviewerOutcome.POSTED));
+        })
+        .handle((outcome, ex) -> {
+          if (ex != null) {
+            var cause = (ex.getCause() != null) ? ex.getCause() : ex;
+            this.logger.warn(
+              "slack.dm.failed",
+              "Failed to DM reviewer %s for %s: %s",
+              email, fp.groupId(), cause.getMessage());
+            return new DmOutcome(email, null, ReviewerOutcome.API_FAILURE);
+          }
+          return outcome;
+        }))
+      .toList();
 
-    for (var email : fp.reviewerEmails()) {
+    var posted = new ArrayList<ReviewerMessage>();
+    var notInSlack = new ArrayList<String>();
+    var apiFailures = new ArrayList<String>();
+    for (var future : perReviewerFutures) {
+      DmOutcome outcome;
       try {
-        String userId = this.slackClient.lookupUserByEmail(email).join();
-        if (userId == null) {
-          this.logger.warn(
-            "slack.lookupByEmail.notFound",
-            "Reviewer %s is not in the Slack workspace; skipping",
-            email);
-          failures.add(email);
-          continue;
-        }
-        SlackClient.PostedMessage message = this.slackClient
-          .postDirectMessage(userId, blocks, fallback)
-          .join();
-        posted.add(new ReviewerMessage(
-          email, userId, message.channelId(), message.messageTs()));
+        outcome = future.join();
       }
       catch (RuntimeException e) {
-        var cause = e.getCause() != null ? e.getCause() : e;
-        this.logger.warn(
-          "slack.dm.failed",
-          "Failed to DM reviewer %s for %s: %s",
-          email, fp.groupId(), cause.getMessage());
-        failures.add(email);
+        // .handle() above already converts failures to API_FAILURE
+        // outcomes, so this catch is defensive only.
+        outcome = null;
+      }
+      if (outcome == null || outcome.outcome() == ReviewerOutcome.API_FAILURE) {
+        apiFailures.add(outcome != null ? outcome.email() : "<unknown>");
+      } else if (outcome.outcome() == ReviewerOutcome.NOT_IN_SLACK) {
+        notInSlack.add(outcome.email());
+      } else {
+        posted.add(outcome.message());
       }
     }
 
     if (posted.isEmpty()) {
+      if (apiFailures.isEmpty()) {
+        // All recipients are policy-defined emails that aren't in the
+        // Slack workspace — typically a misconfigured policy ACL
+        // rather than an outage. Surface a different code so it
+        // alerts on a different runbook.
+        this.logger.error(
+          "slack.allReviewersNotInWorkspace",
+          "Every one of %d reviewer(s) on %s is unknown to the Slack "
+            + "workspace. Likely the policy ACL grants APPROVE_OTHERS to "
+            + "principals who aren't Slack users. emails=%s",
+          fp.reviewerEmails().size(), fp.groupId(), notInSlack);
+        throw new IOException(
+          "None of the " + fp.reviewerEmails().size()
+            + " qualified reviewers on " + fp.groupId()
+            + " are in the Slack workspace");
+      }
       this.logger.error(
         "slack.allDmsFailed",
         "Slack DM delivery failed for every one of %d reviewer(s) on %s. "
           + "See preceding slack.dm.failed entries for the per-reviewer "
-          + "cause (typical: missing Slack scope, invalid bot token, or "
-          + "user not in the workspace).",
-        fp.reviewerEmails().size(), fp.groupId());
+          + "cause (typical: missing Slack scope, invalid bot token, "
+          + "5xx). apiFailures=%d notInSlack=%d",
+        fp.reviewerEmails().size(), fp.groupId(),
+        apiFailures.size(), notInSlack.size());
       throw new IOException(
         "Slack DM delivery failed for every reviewer (" + fp.reviewerEmails().size()
           + ") on " + fp.groupId());
     }
+    var failures = new ArrayList<String>();
+    failures.addAll(notInSlack);
+    failures.addAll(apiFailures);
 
     try {
       this.registry.record(fp.key(), posted, token.expiryTime()).join();
@@ -264,6 +323,26 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   ) throws AccessException, IOException {
     var fp = fingerprint(proposal);
     var approverEmail = operation.user().email;
+
+    //
+    // Wavemm fork: when the requester opted out of automated
+    // notification (notifyReviewers=false), no DMs were sent and no
+    // Firestore registry entry was ever written. There are no sibling
+    // DMs to update — only the beneficiary needs a confirmation that
+    // their request was approved. Skip the registry round-trip
+    // entirely; logging the absence as INFO instead of WARN avoids
+    // false-positive alerts on the operator side.
+    //
+    if (!proposal.notifyReviewers()) {
+      this.logger.info(
+        "slack.onProposalApproved.optOut",
+        "Approving request key=%s with notifyReviewers=false: no "
+          + "registry to update, only DMing the beneficiary. "
+          + "requester=%s group=%s approver=%s",
+        fp.key(), fp.beneficiary(), fp.groupId(), approverEmail);
+      notifyBeneficiary(fp.beneficiary(), fp.groupId(), approverEmail);
+      return;
+    }
 
     var entriesOpt = this.registry.lookup(fp.key()).join();
     if (entriesOpt.isEmpty()) {
@@ -356,4 +435,22 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "notificationTimeZone must not be null");
     }
   }
+
+  /**
+   * Per-reviewer outcome of the parallel DM fan-out in {@link
+   * #onOperationProposed}. Lets the post-loop distinguish "user isn't
+   * in Slack" from "Slack API broke" so the catastrophic
+   * "everybody-failed" error message can name the right culprit.
+   */
+  private enum ReviewerOutcome {
+    POSTED,
+    NOT_IN_SLACK,
+    API_FAILURE
+  }
+
+  private record DmOutcome(
+    @NotNull String email,
+    ReviewerMessage message,
+    @NotNull ReviewerOutcome outcome
+  ) {}
 }

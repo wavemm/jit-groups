@@ -593,6 +593,87 @@ public class TestJitGroupContext {
     assertEquals("123", proposal.input().get("long"));
   }
 
+  /**
+   * Wavemm fork P0-1 regression: when the requester picks a single
+   * approver via the picker, {@code propose(expiry, filter)} must
+   * substitute recipients with that user only — even when the policy
+   * ACL is groups-only after expansion. The previous implementation
+   * passed groups through unconditionally, defeating the picker.
+   */
+  @Test
+  public void join_propose_withReviewerFilter_substitutesRecipients() throws Exception {
+    var subject = Subjects.create(SAMPLE_USER);
+    var groupPolicy = new JitGroupPolicy(
+      "group-1",
+      "Group 1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVER_1, PolicyPermission.APPROVE_OTHERS.toMask())
+        .allow(SAMPLE_APPROVER_2, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(),
+      List.of(),
+      false);
+
+    createEnvironmentPolicy()
+      .add(new SystemPolicy("system-1", "System")
+        .add(groupPolicy));
+
+    var join = new JitGroupContext(
+      groupPolicy,
+      subject,
+      Mockito.mock(Provisioner.class))
+      .join();
+
+    var expiry = Instant.now().plusSeconds(60);
+    var filtered = join.propose(expiry, Set.of(SAMPLE_APPROVER_1));
+
+    assertEquals(
+      Set.of(SAMPLE_APPROVER_1),
+      filtered.recipients(),
+      "Filter must replace the policy-derived approvers, not union with them");
+  }
+
+  /**
+   * Wavemm fork: a null/empty filter falls back to the upstream
+   * "every qualified peer" set, identical to the no-arg overload.
+   * (Validates that the filter overload doesn't accidentally narrow
+   * to nothing when the picker submits with no selection.)
+   */
+  @Test
+  public void join_propose_withNullFilter_keepsPolicyDerivedApprovers() throws Exception {
+    var subject = Subjects.create(SAMPLE_USER);
+    var groupPolicy = new JitGroupPolicy(
+      "group-1",
+      "Group 1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVER_1, PolicyPermission.APPROVE_OTHERS.toMask())
+        .allow(SAMPLE_APPROVER_2, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(),
+      List.of(),
+      false);
+
+    createEnvironmentPolicy()
+      .add(new SystemPolicy("system-1", "System")
+        .add(groupPolicy));
+
+    var join = new JitGroupContext(
+      groupPolicy,
+      subject,
+      Mockito.mock(Provisioner.class))
+      .join();
+
+    var expiry = Instant.now().plusSeconds(60);
+    var withNull = join.propose(expiry, null);
+
+    assertEquals(
+      Set.of(SAMPLE_APPROVER_1, SAMPLE_APPROVER_2),
+      withNull.recipients(),
+      "Null filter must reproduce the upstream behaviour exactly");
+  }
+
   // -------------------------------------------------------------------------
   // approve.
   // -------------------------------------------------------------------------

@@ -29,6 +29,7 @@ import com.google.solutions.jitaccess.auth.*;
 import com.google.solutions.jitaccess.catalog.policy.*;
 import com.google.solutions.jitaccess.catalog.provisioning.Provisioner;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -327,6 +328,47 @@ public class JitGroupContext {
     public @NotNull Proposal propose(
       @NotNull Instant expiry
     ) throws AccessException {
+      return propose(expiry, null);
+    }
+
+    /**
+     * Propose this operation for someone else to approve, optionally
+     * narrowing the set of recipients.
+     *
+     * <p>The picker UX (added in the wavemm fork) lets the requester
+     * choose specific reviewers rather than blasting every qualified
+     * peer. When {@code reviewerFilter} is non-null, the recipient set
+     * REPLACES the policy-derived qualified set with the filter — group
+     * principals from the ACL are dropped so the picker doesn't get
+     * defeated by post-handler group expansion.
+     *
+     * <p>When {@code reviewerFilter} is null the behaviour is identical
+     * to the upstream single-arg {@link #propose(Instant)} method.
+     *
+     * <p><b>SECURITY:</b> the caller is responsible for verifying that
+     * every {@code EndUserId} in {@code reviewerFilter} is actually in
+     * the expanded set of authorised approvers BEFORE invoking this
+     * method. This trust boundary lives at the REST layer
+     * ({@code GroupsResource.post}) where {@link
+     * com.google.solutions.jitaccess.auth.GroupResolver} is available
+     * to expand groups; doing it here would force the catalog package
+     * to depend on Cloud Identity, which is the wrong layering.
+     *
+     * <p>Today {@code GroupsResource.post} is the only caller exercising
+     * the filter path. <b>Any new caller MUST replicate the
+     * subset-validation</b> via {@link
+     * com.google.solutions.jitaccess.web.proposal.ReviewerCandidates}
+     * (or equivalent) — otherwise a hostile {@code reviewerFilter}
+     * could trick this method into producing a JWT naming arbitrary
+     * principals as recipients. (The JWT is not the authoritative
+     * approval check — {@code JitGroupContext.approve} re-evaluates
+     * the policy ACL — but reviewer identity does flow into audit
+     * logs, sibling Slack updates, and copy-link distribution.)
+     */
+    public @NotNull Proposal propose(
+      @NotNull Instant expiry,
+      @Nullable Set<EndUserId> reviewerFilter
+    ) throws AccessException {
       if (!this.requiresApproval) {
         throw new IllegalStateException(
           "The join operation does not require approval and cannot be proposed");
@@ -362,6 +404,40 @@ public class JitGroupContext {
           "There are no principals that could approve the request to join this group");
       }
 
+      //
+      // Apply the requester-supplied filter, if any.
+      //
+      // When a filter is set, it REPLACES the policy-derived approvers
+      // set with the requester's selection. We deliberately don't keep
+      // GroupId entries from the original ACL alongside the filtered
+      // EndUserIds — otherwise a typical Wave ACL of
+      // {group:engineering_platform_security@} would let the group
+      // pass through unchanged, the SlackProposalHandler would expand
+      // it back to every member, and the picker would be a UX lie
+      // (user selects "only Adam", every team-mate gets DM'd anyway).
+      //
+      // The REST layer (GroupsResource) is responsible for validating
+      // that every email in the filter is in the expanded qualified-
+      // peer set BEFORE calling propose — see ReviewerCandidates and
+      // the validation step in GroupsResource.post. By the time we
+      // get here the filter is trusted to be a subset of authorised
+      // approvers, so we can short-circuit straight to the filter.
+      //
+      Set<IamPrincipalId> filteredApprovers;
+      if (reviewerFilter == null || reviewerFilter.isEmpty()) {
+        filteredApprovers = approvers;
+      } else {
+        filteredApprovers = reviewerFilter.stream()
+          .map(u -> (IamPrincipalId) u)
+          .collect(Collectors.toSet());
+      }
+
+      if (filteredApprovers.isEmpty()) {
+        throw new AccessDeniedException(
+          "None of the selected reviewers are authorised to approve this request");
+      }
+
+      var finalApprovers = filteredApprovers;
       return new Proposal() {
         @Override
         public @NotNull EndUserId user() {
@@ -375,7 +451,7 @@ public class JitGroupContext {
 
         @Override
         public @NotNull Set<IamPrincipalId> recipients() {
-          return approvers;
+          return finalApprovers;
         }
 
         @Override

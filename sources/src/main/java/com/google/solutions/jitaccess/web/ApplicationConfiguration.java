@@ -197,6 +197,17 @@ public class ApplicationConfiguration extends AbstractConfiguration {
    */
   final @NotNull Optional<String> slackFirestoreDatabase;
 
+  /**
+   * When true, the {@code POST /api/.../groups/{name}} response includes
+   * the JWT-bearing approval URL so the requester can copy it manually,
+   * and the form accepts {@code notifyReviewers=false} to skip the
+   * automated Slack DM delivery entirely (the JWT is still generated and
+   * signed). Independent of {@link #slackNotificationsEnabled} —
+   * disabling this flag just hides the affordance; Slack DMs continue to
+   * fire as long as Slack is configured.
+   */
+  final boolean slackCopyLinkEnabled;
+
   public ApplicationConfiguration(@NotNull Map<String, String> settingsData) {
     super(settingsData);
 
@@ -324,6 +335,9 @@ public class ApplicationConfiguration extends AbstractConfiguration {
       .orElse(false);
     this.slackBotTokenSecret = readStringSetting("SLACK_BOT_TOKEN_SECRET");
     this.slackFirestoreDatabase = readStringSetting("SLACK_FIRESTORE_DATABASE");
+    this.slackCopyLinkEnabled = readSetting(
+      Boolean::parseBoolean, "SLACK_COPY_LINK_ENABLED")
+      .orElse(false);
   }
 
   public boolean isSmtpConfigured() {

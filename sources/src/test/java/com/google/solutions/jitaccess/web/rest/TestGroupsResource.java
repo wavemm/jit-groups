@@ -76,6 +76,7 @@ public class TestGroupsResource {
     var group = Policies.createJitGroupPolicy("g-1", AccessControlList.EMPTY, Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -93,6 +94,7 @@ public class TestGroupsResource {
     var group = Policies.createJitGroupPolicy("g-1", AccessControlList.EMPTY, Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -122,6 +124,7 @@ public class TestGroupsResource {
         new IamRoleBinding(new ProjectId("project-1"), new IamRole("roles/role-1"), "description", "condition")));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -157,6 +160,7 @@ public class TestGroupsResource {
     var group = Policies.createJitGroupPolicy("g-1", AccessControlList.EMPTY, Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -182,6 +186,7 @@ public class TestGroupsResource {
     var group = Policies.createJitGroupPolicy("g-1", AccessControlList.EMPTY, Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -204,6 +209,7 @@ public class TestGroupsResource {
       Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -234,6 +240,7 @@ public class TestGroupsResource {
       ));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -264,6 +271,7 @@ public class TestGroupsResource {
       ));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -297,6 +305,7 @@ public class TestGroupsResource {
       ));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -325,6 +334,7 @@ public class TestGroupsResource {
       Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -349,6 +359,7 @@ public class TestGroupsResource {
       Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -360,7 +371,7 @@ public class TestGroupsResource {
       group.id().name(),
       new MultivaluedHashMap<>());
 
-    verify(resource.proposalHandler, never()).propose(any(), any());
+    verify(resource.proposalHandler, never()).propose(any(), any(), any());
     verify(resource.auditTrail, times(1)).joinExecuted(
       any(JitGroupContext.JoinOperation.class),
       any(Principal.class));
@@ -381,12 +392,13 @@ public class TestGroupsResource {
       Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
 
-    when(resource.proposalHandler.propose(any(), any()))
+    when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token",
         Set.of(SAMPLE_APPROVING_USER),
@@ -398,7 +410,7 @@ public class TestGroupsResource {
       group.id().name(),
       new MultivaluedHashMap<>());
 
-    verify(resource.proposalHandler, times(1)).propose(any(), any());
+    verify(resource.proposalHandler, times(1)).propose(any(), any(), any());
     verify(resource.auditTrail, times(1)).joinProposed(
       any(JitGroupContext.JoinOperation.class),
       any(ProposalHandler.ProposalToken.class));
@@ -407,6 +419,138 @@ public class TestGroupsResource {
     assertFalse(groupInfo.join().membership().active());
     assertEquals(0, groupInfo.join().satisfiedConstraints().size());
     assertEquals(0, groupInfo.join().unsatisfiedConstraints().size());
+  }
+
+  // -------------------------------------------------------------------------
+  // Wavemm fork: picker-UX tests (Phase 2b/3).
+  // -------------------------------------------------------------------------
+
+  /**
+   * P0-1 regression: a hostile requester submits {@code selectedReviewers}
+   * naming an email that's NOT in the qualified-peer set. The validation
+   * step in {@code post} must reject before {@code propose} is called.
+   */
+  @Test
+  public void post_whenSelectedReviewersIncludeUnauthorisedEmail_rejectsWith403()
+    throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVING_USER, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(
+      com.google.solutions.jitaccess.apis.clients.CloudIdentityGroupsClient.class);
+    when(resource.groupsClient.listMembershipsByUser(any()))
+      .thenReturn(java.util.List.of());
+
+    var inputs = new MultivaluedHashMap<String, String>();
+    inputs.put(GroupsResource.FIELD_SELECTED_REVIEWERS,
+      List.of("attacker@external.com"));
+
+    var thrown = assertThrows(AccessDeniedException.class, () ->
+      resource.post(
+        group.id().environment(),
+        group.id().system(),
+        group.id().name(),
+        inputs));
+    assertTrue(thrown.getMessage().contains("attacker@external.com"));
+
+    // Critical: never reach the proposal handler when validation fails.
+    verify(resource.proposalHandler, never()).propose(any(), any(), any());
+  }
+
+  @Test
+  public void parseSelectedReviewers_capsAtFifty() {
+    // Above the cap → BadRequestException; private-method coverage via
+    // the public POST since parseSelectedReviewers is package-private.
+    var raw = new java.util.ArrayList<String>();
+    for (int i = 0; i < 51; i++) raw.add("user-" + i + "@example.com");
+
+    var inputs = new MultivaluedHashMap<String, String>();
+    inputs.put(GroupsResource.FIELD_SELECTED_REVIEWERS, raw);
+
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+
+    assertThrows(jakarta.ws.rs.BadRequestException.class, () ->
+      resource.post(
+        group.id().environment(),
+        group.id().system(),
+        group.id().name(),
+        inputs));
+  }
+
+  @Test
+  public void post_whenNotifyReviewersFalse_passesOptionToProposeAndReturnsApprovalUrl()
+    throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(true);  // copy-link mode on
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    // copy-link mode reaches through buildActionUri.apply(...) to build
+    // the approvalUrl in the response, so linkBuilder + uriInfo need
+    // working stubs unlike the non-copy-link tests above.
+    resource.linkBuilder = uriInfo -> jakarta.ws.rs.core.UriBuilder
+      .fromUri("https://example.test/");
+    resource.uriInfo = Mockito.mock(jakarta.ws.rs.core.UriInfo.class);
+
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        // TokenObfuscator.encode requires a JWT-shaped string ("ey..." +
+        // dot-segments), so a literal "stub-jwt" trips its preconditions
+        // when copy-link mode actually applies the buildActionUri.
+        "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0In0.",
+        Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
+
+    var inputs = new MultivaluedHashMap<String, String>();
+    // Hidden-then-checkbox pattern: only the hidden's "false" present
+    // ⇒ user unchecked the toggle ⇒ notifyReviewers must propagate
+    // false to the handler.
+    inputs.put(GroupsResource.FIELD_NOTIFY_REVIEWERS, List.of("false"));
+
+    var groupInfo = resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      inputs);
+
+    var captor = org.mockito.ArgumentCaptor.forClass(
+      ProposalHandler.ProposeOptions.class);
+    verify(resource.proposalHandler).propose(any(), any(), captor.capture());
+    assertFalse(captor.getValue().notifyReviewers(),
+      "ProposeOptions.notifyReviewers must reflect the form field");
+
+    assertNotNull(groupInfo.join().approvalUrl(),
+      "copy-link mode + JOIN_PROPOSED must surface the approval URL");
   }
 
   //---------------------------------------------------------------------------
@@ -418,6 +562,7 @@ public class TestGroupsResource {
     var group = Policies.createJitGroupPolicy("g-1", AccessControlList.EMPTY, Map.of());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
@@ -435,6 +580,7 @@ public class TestGroupsResource {
     var groupId = new JitGroupId("env-1", "system-1", "group-1");
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = Mockito.mock(Catalog.class);
@@ -458,6 +604,7 @@ public class TestGroupsResource {
       .thenReturn(Optional.empty());
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = Mockito.mock(Catalog.class);
@@ -481,6 +628,7 @@ public class TestGroupsResource {
       .thenReturn(Optional.of(new GroupKey("abc")));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.consoles = new Consoles(new OrganizationId("123"));
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
@@ -510,6 +658,7 @@ public class TestGroupsResource {
       .thenReturn(new GroupId("group@example.com"));
 
     var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
     resource.consoles = new Consoles(new OrganizationId("123"));
     resource.logger = Mockito.mock(Logger.class);
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);

@@ -119,6 +119,12 @@ public class TestSlackProposalHandler {
     when(p.group()).thenReturn(GROUP);
     when(p.input()).thenReturn(Map.of("justification", "CASE-123"));
     when(p.expiry()).thenReturn(Instant.now().plus(Duration.ofMinutes(60)));
+    // Default: notify reviewers (= upstream behaviour). Tests covering
+    // the opt-out short-circuit override this with thenReturn(false).
+    // Explicitly stubbing here is required because Proposal#notifyReviewers
+    // is a Java default method, and Mockito returns boolean default
+    // (false) for unstubbed default methods on mocked interfaces.
+    when(p.notifyReviewers()).thenReturn(true);
     return p;
   }
 
@@ -269,6 +275,45 @@ public class TestSlackProposalHandler {
 
     // No siblings to update (we lost the registry), but Alice still gets her DM.
     verify(slack, never()).updateMessage(anyString(), anyString(), anyList(), anyString());
+    verify(slack).lookupUserByEmail(eq("alice@example.com"));
+    verify(slack).postDirectMessage(anyString(), anyList(), anyString());
+  }
+
+  /**
+   * P1-2 regression: when the requester opted out of automated DM
+   * delivery (notifyReviewers=false), no DMs were sent at propose-time
+   * and no Firestore registry entry was ever written. On approval,
+   * the handler must SHORT-CIRCUIT — no registry lookup, no sibling
+   * updates — and only DM the beneficiary. The previous (Phase 2a)
+   * behaviour spuriously WARN-logged "no Slack registry entry" because
+   * the lookup miss looked like a Firestore failure mode.
+   */
+  @Test
+  public void onProposalApproved_optOutShortCircuitsRegistryLookup() throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var approval = mock(JitGroupContext.ApprovalOperation.class);
+    when(approval.user()).thenReturn(BOB);
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL));
+    when(proposal.notifyReviewers()).thenReturn(false);  // opt-out path
+
+    handler.onProposalApproved(approval, proposal);
+
+    // Critical: no registry round-trip on the opt-out path. The
+    // entry never existed — querying Firestore would just produce
+    // noise.
+    verify(registry, never()).lookup(anyString());
+    verify(registry, never()).delete(anyString());
+
+    // Sibling updates are inherently skipped (no entries to update),
+    // so updateMessage must not fire.
+    verify(slack, never()).updateMessage(anyString(), anyString(), anyList(), anyString());
+
+    // Beneficiary still gets a confirmation DM — that's independent
+    // of how the original notification was delivered.
     verify(slack).lookupUserByEmail(eq("alice@example.com"));
     verify(slack).postDirectMessage(anyString(), anyList(), anyString());
   }

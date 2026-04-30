@@ -220,6 +220,13 @@ public class Application {
   }
 
   @Produces
+  @Singleton
+  public com.google.solutions.jitaccess.web.rest.GroupsResource.Options produceGroupsResourceOptions() {
+    return new com.google.solutions.jitaccess.web.rest.GroupsResource.Options(
+      configuration.slackCopyLinkEnabled);
+  }
+
+  @Produces
   public GoogleCredentials produceApplicationCredentials() {
     return runtime.applicationCredentials();
   }
@@ -391,7 +398,8 @@ public class Application {
         @Override
         public @NotNull ProposalHandler.ProposalToken propose(
           @NotNull JitGroupContext.JoinOperation joinOperation,
-          @NotNull Function<String, URI> buildActionUri
+          @NotNull Function<String, URI> buildActionUri,
+          @NotNull ProposalHandler.ProposeOptions options
           ) {
           throw new UnsupportedOperationException(
             "Approvals are not supported because the SMTP configuration is incomplete");
