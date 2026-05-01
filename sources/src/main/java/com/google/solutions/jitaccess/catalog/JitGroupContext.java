@@ -345,25 +345,27 @@ public class JitGroupContext {
      * <p>When {@code reviewerFilter} is null the behaviour is identical
      * to the upstream single-arg {@link #propose(Instant)} method.
      *
-     * <p><b>SECURITY:</b> the caller is responsible for verifying that
-     * every {@code EndUserId} in {@code reviewerFilter} is actually in
-     * the expanded set of authorised approvers BEFORE invoking this
-     * method. This trust boundary lives at the REST layer
+     * <p><b>SECURITY (defense-in-depth, wavemm fork P1-6):</b> the catalog
+     * enforces what it can locally — every {@code EndUserId} in the
+     * filter must either appear directly in the policy ACL, OR the ACL
+     * must contain at least one {@link GroupId} approver into which the
+     * caller has already verified the filter expands. The full subset-
+     * after-group-expansion check still lives at the REST layer
      * ({@code GroupsResource.post}) where {@link
-     * com.google.solutions.jitaccess.auth.GroupResolver} is available
-     * to expand groups; doing it here would force the catalog package
-     * to depend on Cloud Identity, which is the wrong layering.
+     * com.google.solutions.jitaccess.auth.GroupResolver} is available;
+     * forcing the catalog to depend on Cloud Identity would be the
+     * wrong layering. But a future caller that forgets the REST-layer
+     * check still cannot smuggle in a principal who has no chance of
+     * being a real approver — the catalog rejects filter entries that
+     * are not in the direct ACL and have no group approver to
+     * conceivably belong to.
      *
-     * <p>Today {@code GroupsResource.post} is the only caller exercising
-     * the filter path. <b>Any new caller MUST replicate the
-     * subset-validation</b> via {@link
-     * com.google.solutions.jitaccess.web.proposal.ReviewerCandidates}
-     * (or equivalent) — otherwise a hostile {@code reviewerFilter}
-     * could trick this method into producing a JWT naming arbitrary
-     * principals as recipients. (The JWT is not the authoritative
-     * approval check — {@code JitGroupContext.approve} re-evaluates
-     * the policy ACL — but reviewer identity does flow into audit
-     * logs, sibling Slack updates, and copy-link distribution.)
+     * <p>This is a partial defense: an ACL of
+     * {@code group:engineering@} still allows the catalog to honour a
+     * filter naming any email (because the email <i>could</i> be in
+     * the group, and the catalog can't tell from here). The REST
+     * layer's expansion check is what closes that gap — see {@link
+     * com.google.solutions.jitaccess.web.proposal.ReviewerCandidates}.
      */
     public @NotNull Proposal propose(
       @NotNull Instant expiry,
@@ -418,15 +420,40 @@ public class JitGroupContext {
       //
       // The REST layer (GroupsResource) is responsible for validating
       // that every email in the filter is in the expanded qualified-
-      // peer set BEFORE calling propose — see ReviewerCandidates and
-      // the validation step in GroupsResource.post. By the time we
-      // get here the filter is trusted to be a subset of authorised
-      // approvers, so we can short-circuit straight to the filter.
+      // peer set BEFORE calling propose. The defense-in-depth check
+      // below catches the case where a future caller forgets that
+      // step — we reject filter entries that are not in the direct
+      // ACL when the ACL has no group approvers, since in that case
+      // the catalog has full visibility into who's authorised.
       //
       Set<IamPrincipalId> filteredApprovers;
       if (reviewerFilter == null || reviewerFilter.isEmpty()) {
         filteredApprovers = approvers;
       } else {
+        var directAclEndUsers = approvers.stream()
+          .filter(EndUserId.class::isInstance)
+          .map(EndUserId.class::cast)
+          .collect(Collectors.toSet());
+        var aclHasGroupApprover = approvers.stream()
+          .anyMatch(GroupId.class::isInstance);
+
+        // Reject filter entries the catalog can prove are not
+        // authorised. If the ACL has no group approver every entry
+        // must be in directAclEndUsers; if there's a group approver
+        // we can't prove it without expansion, so we trust the REST
+        // layer's check (which has run, modulo a calling-code bug).
+        if (!aclHasGroupApprover) {
+          var bogus = reviewerFilter.stream()
+            .filter(u -> !directAclEndUsers.contains(u))
+            .map(u -> u.email)
+            .toList();
+          if (!bogus.isEmpty()) {
+            throw new AccessDeniedException(
+              "Selected reviewers are not authorised to approve this "
+                + "request: " + String.join(", ", bogus));
+          }
+        }
+
         filteredApprovers = reviewerFilter.stream()
           .map(u -> (IamPrincipalId) u)
           .collect(Collectors.toSet());

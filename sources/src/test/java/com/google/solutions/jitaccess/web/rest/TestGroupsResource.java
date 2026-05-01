@@ -411,9 +411,14 @@ public class TestGroupsResource {
       new MultivaluedHashMap<>());
 
     verify(resource.proposalHandler, times(1)).propose(any(), any(), any());
+    // Wavemm fork P1-8/P2-10: 3-arg overload carries the
+    // notifyReviewers boolean so the audit log can split copy-link
+    // from the regular DM-everyone flow. Unchecked POST → defaults
+    // to true, matching upstream semantics.
     verify(resource.auditTrail, times(1)).joinProposed(
       any(JitGroupContext.JoinOperation.class),
-      any(ProposalHandler.ProposalToken.class));
+      any(ProposalHandler.ProposalToken.class),
+      eq(true));
 
     assertEquals(GroupsResource.JoinStatusInfo.JOIN_PROPOSED, groupInfo.join().status());
     assertFalse(groupInfo.join().membership().active());
@@ -500,6 +505,49 @@ public class TestGroupsResource {
         inputs));
   }
 
+  /**
+   * Wavemm fork P2-9: malformed email entries in the picker submission
+   * (e.g. "@@@@", "user@", "spaces in@email.com") used to slip through
+   * the old "contains @" check and become {@code EndUserId} instances
+   * that propagated to audit logs and downstream ACL diffs. The
+   * stricter regex-backed parse rejects them at the REST boundary.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = {
+    "@@@@",
+    "user@",
+    "@example.com",
+    "no-at-sign",
+    "spaces in@example.com",
+    "user@host with spaces"
+  })
+  public void parseSelectedReviewers_rejectsMalformedEmails(String hostile) {
+    var inputs = new MultivaluedHashMap<String, String>();
+    inputs.put(GroupsResource.FIELD_SELECTED_REVIEWERS, List.of(hostile));
+
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+
+    var ex = assertThrows(
+      jakarta.ws.rs.BadRequestException.class,
+      () -> resource.post(
+        group.id().environment(),
+        group.id().system(),
+        group.id().name(),
+        inputs));
+    assertTrue(ex.getMessage().contains("selectedReviewers"),
+      "rejection message must name the field; got: " + ex.getMessage());
+  }
+
   @Test
   public void post_whenNotifyReviewersFalse_passesOptionToProposeAndReturnsApprovalUrl()
     throws Exception {
@@ -549,8 +597,72 @@ public class TestGroupsResource {
     assertFalse(captor.getValue().notifyReviewers(),
       "ProposeOptions.notifyReviewers must reflect the form field");
 
+    // Wavemm fork P1-8/P2-10: the audit-trail event must carry
+    // notifyReviewers=false so the BigQuery sink can slice copy-link
+    // out of the regular DM-everyone propose flow.
+    verify(resource.auditTrail).joinProposed(
+      any(JitGroupContext.JoinOperation.class),
+      any(ProposalHandler.ProposalToken.class),
+      eq(false));
+
     assertNotNull(groupInfo.join().approvalUrl(),
       "copy-link mode + JOIN_PROPOSED must surface the approval URL");
+  }
+
+  //---------------------------------------------------------------------------
+  // getReviewers — rate limit (wavemm fork P1-4).
+  //---------------------------------------------------------------------------
+
+  /**
+   * The reviewer picker calls into ReviewerCandidates which itself
+   * does one listMembershipsByUser + a parallel listMemberships
+   * fan-out. A polling client could therefore burn through the JIT
+   * SA's Cloud Identity quota and DoS legitimate elevations. We
+   * cap to {@link GroupsResource#REVIEWERS_RATE_PER_SECOND} per
+   * second per authenticated user, with a burst allowance — verify
+   * here that exhausting the burst and then asking for one more
+   * permit fails (drives the 429 path in the resource method).
+   */
+  @Test
+  public void getReviewers_rateLimitTripsOnPolling() {
+    GroupsResource.clearReviewerRateLimiters();
+    var limiter = GroupsResource.rateLimiterFor("ratelimit-test@example.com");
+
+    // The Guava SmoothBursty limiter starts with one permit available;
+    // additional permits are accrued at REVIEWERS_RATE_PER_SECOND. The
+    // first acquire must succeed (covers the "single picker open"
+    // case), and a tight loop right after must trip the limit (covers
+    // the "polling client" case). Without sleeps in the test we don't
+    // assert the *exact* burst capacity — only that the limiter
+    // rejects sustained polling, which is the security-relevant
+    // property.
+    assertTrue(limiter.tryAcquire(),
+      "first call after a quiet period must always succeed");
+
+    boolean rejected = false;
+    for (int i = 0; i < 200; i++) {
+      if (!limiter.tryAcquire()) {
+        rejected = true;
+        break;
+      }
+    }
+    assertTrue(rejected,
+      "a tight 200-call loop must hit the rate limit at least once "
+        + "— otherwise a polling frontend can exhaust Cloud Identity quota");
+  }
+
+  @Test
+  public void getReviewers_rateLimitIsPerUser() {
+    GroupsResource.clearReviewerRateLimiters();
+    var alice = GroupsResource.rateLimiterFor("alice@example.com");
+    var bob = GroupsResource.rateLimiterFor("bob@example.com");
+
+    // Drain alice's permits
+    while (alice.tryAcquire()) { /* burn */ }
+
+    assertTrue(bob.tryAcquire(),
+      "bob's bucket must be independent of alice's — otherwise one "
+        + "noisy user can DoS every other user's picker");
   }
 
   //---------------------------------------------------------------------------

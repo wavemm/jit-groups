@@ -29,6 +29,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 
 /**
  * Proposal handler that delivers approval requests via Slack DMs instead
@@ -71,6 +73,18 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   private final @NotNull Logger logger;
   private final @NotNull Options slackOptions;
 
+  /**
+   * Hard ceiling on the number of in-flight Slack API call chains during
+   * the per-reviewer fan-out in {@link #onOperationProposed}. A policy
+   * with a 200-member approver group would otherwise launch 200 parallel
+   * lookup→postMessage chains and risk tripping Slack's per-workspace
+   * Tier 4 quota (chat.postMessage ~100/min). With a Semaphore in front
+   * of each chain, peak in-flight calls are bounded regardless of how
+   * many reviewers a policy expands to. Permits are released in
+   * {@code .whenComplete} so failures don't leak the slot.
+   */
+  private final @NotNull Semaphore fanOutLimiter;
+
   public SlackProposalHandler(
     @NotNull TokenSigner tokenSigner,
     @NotNull SlackClient slackClient,
@@ -89,6 +103,7 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     this.groupResolver = groupResolver;
     this.logger = logger;
     this.slackOptions = slackOptions;
+    this.fanOutLimiter = new Semaphore(slackOptions.maxConcurrentFanOut(), /*fair*/ true);
   }
 
   /**
@@ -127,7 +142,7 @@ public class SlackProposalHandler extends AbstractProposalHandler {
       .distinct()
       .sorted()
       .toList();
-    var key = SlackMessageRegistry.requestKey(beneficiary, groupId, reviewerEmails);
+    var key = this.registry.requestKey(beneficiary, groupId, reviewerEmails);
     return new RegistryFingerprint(beneficiary, groupId, reviewerEmails, key);
   }
 
@@ -211,34 +226,60 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     // Tracking these separately means the "all failed" error message
     // tells the operator whether to fix Slack config or fix the policy.
     //
+    //
+    // Per-reviewer chains are gated through fanOutLimiter so we never
+    // have more than slackOptions.maxConcurrentFanOut() in-flight Slack
+    // API call pairs at once. A 200-member approver-group policy fans
+    // out at the cap rate instead of slamming the workspace Tier 4
+    // budget. Permits are released in .whenComplete so the slot frees
+    // even when the chain failed exceptionally.
+    //
     var perReviewerFutures = fp.reviewerEmails().stream()
-      .map(email -> this.slackClient.lookupUserByEmail(email)
-        .thenCompose(userId -> {
-          if (userId == null) {
-            this.logger.warn(
-              "slack.lookupByEmail.notFound",
-              "Reviewer %s is not in the Slack workspace; skipping",
-              email);
-            return java.util.concurrent.CompletableFuture.completedFuture(
-              new DmOutcome(email, null, ReviewerOutcome.NOT_IN_SLACK));
-          }
-          return this.slackClient.postDirectMessage(userId, blocks, fallback)
-            .thenApply(msg -> new DmOutcome(
-              email,
-              new ReviewerMessage(email, userId, msg.channelId(), msg.messageTs()),
-              ReviewerOutcome.POSTED));
-        })
-        .handle((outcome, ex) -> {
-          if (ex != null) {
-            var cause = (ex.getCause() != null) ? ex.getCause() : ex;
-            this.logger.warn(
-              "slack.dm.failed",
-              "Failed to DM reviewer %s for %s: %s",
-              email, fp.groupId(), cause.getMessage());
-            return new DmOutcome(email, null, ReviewerOutcome.API_FAILURE);
-          }
-          return outcome;
-        }))
+      .map(email -> {
+        try {
+          this.fanOutLimiter.acquire();
+        }
+        catch (InterruptedException ie) {
+          // Caller's thread was interrupted while we were holding the
+          // line; surface as a NOT_IN_SLACK-equivalent skip rather than
+          // crashing the whole propose call. The interrupt status is
+          // restored so upstream code can react.
+          Thread.currentThread().interrupt();
+          return CompletableFuture.completedFuture(
+            new DmOutcome(email, null, ReviewerOutcome.API_FAILURE));
+        }
+        return this.slackClient.lookupUserByEmail(email)
+          .thenCompose(userId -> {
+            if (userId == null) {
+              this.logger.warn(
+                "slack.lookupByEmail.notFound",
+                "Reviewer %s is not in the Slack workspace; skipping",
+                email);
+              return CompletableFuture.completedFuture(
+                new DmOutcome(email, null, ReviewerOutcome.NOT_IN_SLACK));
+            }
+            return this.slackClient.postDirectMessage(userId, blocks, fallback)
+              .thenApply(msg -> new DmOutcome(
+                email,
+                new ReviewerMessage(email, userId, msg.channelId(), msg.messageTs()),
+                ReviewerOutcome.POSTED));
+          })
+          .handle((outcome, ex) -> {
+            if (ex != null) {
+              var cause = (ex.getCause() != null) ? ex.getCause() : ex;
+              this.logger.warn(
+                "slack.dm.failed",
+                "Failed to DM reviewer %s for %s: %s",
+                email, fp.groupId(), cause.getMessage());
+              return new DmOutcome(email, null, ReviewerOutcome.API_FAILURE);
+            }
+            return outcome;
+          })
+          // Free the concurrency slot on every completion path
+          // (success, NOT_IN_SLACK, API_FAILURE). Use whenComplete so
+          // the value passes through unchanged.
+          .whenComplete((__, ___) -> this.fanOutLimiter.release());
+      })
       .toList();
 
     var posted = new ArrayList<ReviewerMessage>();
@@ -424,15 +465,44 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   /**
    * Slack-specific options.
    *
-   * @param notificationTimeZone Time zone used to render expiry timestamps in DMs.
+   * @param notificationTimeZone time zone used to render expiry
+   *                             timestamps in DMs
+   * @param maxConcurrentFanOut  hard ceiling on concurrent
+   *                             {@code lookupUserByEmail+postMessage}
+   *                             chains during {@link
+   *                             #onOperationProposed}. Defaults via
+   *                             {@link #DEFAULT_MAX_CONCURRENT_FAN_OUT}
+   *                             to a value sized below Slack's Tier 4
+   *                             quota when policies have many
+   *                             reviewers; tune downward only on
+   *                             quota-pressure incidents.
    */
   public record Options(
-    @NotNull ZoneId notificationTimeZone
+    @NotNull ZoneId notificationTimeZone,
+    int maxConcurrentFanOut
   ) {
+    /**
+     * Default chosen so that even a 200-reviewer approver-group
+     * fan-out completes inside the typical request timeout while
+     * staying well under chat.postMessage Tier 4 (≈100/min/workspace
+     * sustained, with short bursts allowed). 8 in-flight × ~200 ms
+     * round-trip ≈ 40 req/s peak, settling around 1 req/s after
+     * Slack's leaky-bucket smoothing.
+     */
+    public static final int DEFAULT_MAX_CONCURRENT_FAN_OUT = 8;
+
     public Options {
       Preconditions.checkArgument(
         notificationTimeZone != null,
         "notificationTimeZone must not be null");
+      Preconditions.checkArgument(
+        maxConcurrentFanOut > 0,
+        "maxConcurrentFanOut must be > 0");
+    }
+
+    /** Convenience constructor that uses {@link #DEFAULT_MAX_CONCURRENT_FAN_OUT}. */
+    public Options(@NotNull ZoneId notificationTimeZone) {
+      this(notificationTimeZone, DEFAULT_MAX_CONCURRENT_FAN_OUT);
     }
   }
 

@@ -674,6 +674,93 @@ public class TestJitGroupContext {
       "Null filter must reproduce the upstream behaviour exactly");
   }
 
+  /**
+   * Wavemm fork P1-6 (catalog owns the invariant): when the policy ACL
+   * has only direct EndUserId approvers, the catalog can fully verify
+   * the filter locally — and must reject any entry that isn't in the
+   * direct ACL. This catches a future caller that forgets the
+   * REST-layer subset-after-expansion check (defense in depth).
+   */
+  @Test
+  public void join_propose_withFilterContainingNonAclUser_andNoGroupApprover_throws() {
+    var subject = Subjects.create(SAMPLE_USER);
+    var groupPolicy = new JitGroupPolicy(
+      "group-1",
+      "Group 1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVER_1, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(),
+      List.of(),
+      false);
+
+    createEnvironmentPolicy()
+      .add(new SystemPolicy("system-1", "System")
+        .add(groupPolicy));
+
+    var join = new JitGroupContext(
+      groupPolicy,
+      subject,
+      Mockito.mock(Provisioner.class))
+      .join();
+
+    var expiry = Instant.now().plusSeconds(60);
+    var hostileFilter = Set.of(
+      SAMPLE_APPROVER_1,                 // legitimate
+      new EndUserId("attacker@evil"));   // not in ACL
+
+    var ex = assertThrows(
+      AccessDeniedException.class,
+      () -> join.propose(expiry, hostileFilter));
+    assertTrue(ex.getMessage().contains("attacker@evil"),
+      "Catalog must name the rejected principal so the operator can "
+        + "trace which caller forgot the REST-layer expansion check; got: "
+        + ex.getMessage());
+  }
+
+  /**
+   * Wavemm fork P1-6: when the ACL contains a {@link GroupId} approver,
+   * the catalog cannot prove a filter entry isn't a member of that
+   * group without going to Cloud Identity. It therefore trusts the
+   * REST layer's expansion-aware check and lets the filter through.
+   * This preserves the typical "team approves team" pattern.
+   */
+  @Test
+  public void join_propose_withFilterAndAclHasGroupApprover_trustsRestLayer()
+    throws Exception {
+    var subject = Subjects.create(SAMPLE_USER);
+    var groupPolicy = new JitGroupPolicy(
+      "group-1",
+      "Group 1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVER_GROUP, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(),
+      List.of(),
+      false);
+
+    createEnvironmentPolicy()
+      .add(new SystemPolicy("system-1", "System")
+        .add(groupPolicy));
+
+    var join = new JitGroupContext(
+      groupPolicy,
+      subject,
+      Mockito.mock(Provisioner.class))
+      .join();
+
+    // SAMPLE_APPROVER_1 isn't in the ACL directly, but the ACL has a
+    // group approver — we trust the REST layer to have confirmed
+    // SAMPLE_APPROVER_1 ∈ expand(SAMPLE_APPROVER_GROUP).
+    var expiry = Instant.now().plusSeconds(60);
+    var proposal = join.propose(expiry, Set.of(SAMPLE_APPROVER_1));
+
+    assertEquals(Set.of(SAMPLE_APPROVER_1), proposal.recipients(),
+      "Filter through with group ACL must produce the filtered set");
+  }
+
   // -------------------------------------------------------------------------
   // approve.
   // -------------------------------------------------------------------------

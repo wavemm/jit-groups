@@ -21,6 +21,9 @@
 
 package com.google.solutions.jitaccess.web.rest;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.util.concurrent.RateLimiter;
 import com.google.solutions.jitaccess.apis.Logger;
 import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
 import com.google.solutions.jitaccess.apis.clients.CloudIdentityGroupsClient;
@@ -234,7 +237,13 @@ public class GroupsResource {
             selectedReviewers,
             notifyReviewers));
 
-        this.auditTrail.joinProposed(joinOp, proposal);
+        // Plumb the notifyReviewers flag into the audit event so the
+        // log-based BigQuery dashboard distinguishes copy-link
+        // ("notifyReviewers=false") from the regular DM-everyone flow.
+        // Both still fall under api.groups.join — same event id —
+        // because they're the same domain action; the new label is
+        // what splits them.
+        this.auditTrail.joinProposed(joinOp, proposal, notifyReviewers);
 
         // Surface the approval URL to the requester only when copy-link
         // mode is enabled — it lets them paste it manually elsewhere.
@@ -284,12 +293,47 @@ public class GroupsResource {
   static final int SELECTED_REVIEWERS_MAX = 50;
 
   /**
+   * Strict shape validator for picker-submitted reviewer emails.
+   *
+   * <p>Wavemm fork P2-9: {@link EndUserId#parse}'s canonical regex
+   * {@code ^user:(.+)@(.+)$} is too permissive — it accepts
+   * {@code "@@@@"} (greedy {@code .+} eats {@code @}), strings with
+   * embedded whitespace, and multi-{@code @} forms. We need a tighter
+   * shape check at the REST boundary because anything that gets past
+   * here ends up in audit logs, Slack DM addressing, and the
+   * downstream subset-of-qualified-peers check (which is set-based
+   * and would silently drop the bogus value rather than alert).
+   *
+   * <p>Pattern rationale:
+   * <ul>
+   *   <li>local-part: one or more chars, none of which are {@code @}
+   *       or whitespace;
+   *   <li>exactly one {@code @};
+   *   <li>domain: at least one label, a dot, and a TLD label, with no
+   *       {@code @} or whitespace anywhere.
+   * </ul>
+   * That's deliberately stricter than RFC 5321 (we don't bother with
+   * IP-literal hosts, quoted local parts, etc.) — Wave's IdP only
+   * issues domain-shaped emails and the picker only ever submits
+   * those.
+   */
+  private static final java.util.regex.Pattern SELECTED_REVIEWER_EMAIL_PATTERN =
+    java.util.regex.Pattern.compile(
+      "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$");
+
+  /**
    * Parse the {@code selectedReviewers} multi-value form field into a
    * {@code Set<EndUserId>}. Empty/missing → null (no filter, default
    * behaviour). Bounded at {@link #SELECTED_REVIEWERS_MAX} to keep a
    * hostile client from forcing arbitrary memory and Cloud Identity
-   * lookups; values without an {@code @} are rejected so we don't end
-   * up constructing meaningless {@code EndUserId}s.
+   * lookups.
+   *
+   * <p>Each value is shape-validated against {@link
+   * #SELECTED_REVIEWER_EMAIL_PATTERN} (wavemm fork P2-9) instead of
+   * the previous "contains @" check. Anything that doesn't match —
+   * empty local-part, multiple {@code @}, embedded whitespace, no TLD
+   * — gets rejected with a 400 so the client can fix the form rather
+   * than have it silently propagate as a malformed principal.
    */
   private static @Nullable Set<EndUserId> parseSelectedReviewers(
     @Nullable List<String> raw
@@ -302,12 +346,19 @@ public class GroupsResource {
         "Too many reviewer selections (got " + raw.size()
           + ", max " + SELECTED_REVIEWERS_MAX + ")");
     }
-    var parsed = raw.stream()
-      .filter(s -> s != null && !s.isBlank())
-      .map(String::trim)
-      .filter(s -> s.contains("@"))
-      .map(EndUserId::new)
-      .collect(Collectors.toSet());
+    var parsed = new java.util.HashSet<EndUserId>();
+    for (var value : raw) {
+      if (value == null || value.isBlank()) {
+        continue;
+      }
+      var trimmed = value.trim();
+      if (!SELECTED_REVIEWER_EMAIL_PATTERN.matcher(trimmed).matches()) {
+        throw new BadRequestException(
+          "selectedReviewers contains a value that is not a valid email: '"
+            + trimmed + "'");
+      }
+      parsed.add(new EndUserId(trimmed));
+    }
     return parsed.isEmpty() ? null : parsed;
   }
 
@@ -317,6 +368,52 @@ public class GroupsResource {
     }
     // Last value wins (browsers may submit duplicates from a checkbox).
     return Boolean.parseBoolean(raw.get(raw.size() - 1));
+  }
+
+  /**
+   * Per-user rate limit on {@link #getReviewers}. Each {@link
+   * ReviewerCandidates#compute} call is expensive — one
+   * {@code listMembershipsByUser} on the requester plus a parallel
+   * {@code listMemberships} fan-out across every group they belong to.
+   * Without a cap, a hostile (or buggy) frontend that polls the picker
+   * could trivially burn through the JIT App Engine SA's Cloud Identity
+   * quota and DoS legitimate elevation requests.
+   *
+   * <p>The bucket size and refill rate are chosen so a normal user
+   * filling out the picker (a few searches, maybe a refresh) sees no
+   * throttling, while a script polling at &gt;1 req/s gets 429s within
+   * a couple of seconds. Buckets evict after 5 min idle to bound
+   * memory in the face of many distinct callers.
+   */
+  static final double REVIEWERS_RATE_PER_SECOND = 1.0;
+  private static final Cache<String, RateLimiter> REVIEWERS_RATE_LIMITERS =
+    CacheBuilder.newBuilder()
+      .expireAfterAccess(Duration.ofMinutes(5))
+      .maximumSize(10_000)
+      .build();
+
+  // Package-private for tests; the cache lives in the same JVM, so
+  // tests that exercise it must reset state through clearReviewerLimiters().
+  static void clearReviewerRateLimiters() {
+    REVIEWERS_RATE_LIMITERS.invalidateAll();
+  }
+
+  static @NotNull RateLimiter rateLimiterFor(@NotNull String userKey) {
+    try {
+      // Guava's SmoothBursty RateLimiter accumulates up to one second of
+      // permits when idle — close enough to the burst pattern we want
+      // (one full picker open + a few quick edits). We don't try to
+      // hand-tune the burst here; the empirical floor for noisy clients
+      // is set by REVIEWERS_RATE_PER_SECOND once the burst is drained.
+      return REVIEWERS_RATE_LIMITERS.get(
+        userKey,
+        () -> RateLimiter.create(REVIEWERS_RATE_PER_SECOND));
+    }
+    catch (java.util.concurrent.ExecutionException e) {
+      // CacheLoader throwing is impossible here (lambda doesn't throw);
+      // defensive fallback uses a fresh limiter.
+      return RateLimiter.create(REVIEWERS_RATE_PER_SECOND);
+    }
   }
 
   /**
@@ -344,6 +441,20 @@ public class GroupsResource {
       // requester (filtered at principal level here; ReviewerCandidates
       // also filters at email level after group expansion).
       var requester = this.subject.user();
+
+      // Per-user rate limit. Failing to acquire surfaces as a 429 so a
+      // polling client backs off rather than silently DoSing the Cloud
+      // Identity quota. Authenticated principal email is the bucket
+      // key — IAP guarantees this is the actual end user, not a
+      // header-set value.
+      if (!rateLimiterFor(requester.email).tryAcquire()) {
+        this.logger.warn(
+          EventIds.API_VIEW_GROUPS,
+          "Reviewer-picker rate limit exceeded by %s on %s",
+          requester.email, groupId);
+        throw new WebApplicationException(
+          "Too many requests; please retry shortly.", 429);
+      }
       var qualified = group.policy().effectiveAccessControlList()
         .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
         .stream()
