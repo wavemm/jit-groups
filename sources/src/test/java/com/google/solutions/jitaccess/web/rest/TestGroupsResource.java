@@ -21,10 +21,14 @@
 
 package com.google.solutions.jitaccess.web.rest;
 
+import com.google.api.services.cloudidentity.v1.model.EntityKey;
+import com.google.api.services.cloudidentity.v1.model.Membership;
+import com.google.api.services.cloudidentity.v1.model.MembershipRelation;
 import com.google.solutions.jitaccess.apis.Logger;
 import com.google.solutions.jitaccess.apis.OrganizationId;
 import com.google.solutions.jitaccess.apis.ProjectId;
 import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
+import com.google.solutions.jitaccess.apis.clients.CloudIdentityGroupsClient;
 import com.google.solutions.jitaccess.apis.clients.GroupKey;
 import com.google.solutions.jitaccess.auth.*;
 import com.google.solutions.jitaccess.catalog.*;
@@ -607,6 +611,169 @@ public class TestGroupsResource {
 
     assertNotNull(groupInfo.join().approvalUrl(),
       "copy-link mode + JOIN_PROPOSED must surface the approval URL");
+  }
+
+  // -------------------------------------------------------------------------
+  // Wavemm fork: auto-narrow on empty selection (SECOP-952).
+  // -------------------------------------------------------------------------
+
+  /**
+   * SECOP-952: a small, group-free approver set on an empty picker
+   * selection keeps the upstream "DM everyone" behaviour — propose is
+   * called with a {@code null} reviewer filter, and we don't touch the
+   * Cloud Identity groups client at all.
+   */
+  @Test
+  public void post_whenNoReviewersPickedAndApproverSetSmall_proposesWithNullFilter()
+    throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+        .allow(SAMPLE_APPROVING_USER, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
+
+    resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      new MultivaluedHashMap<>());
+
+    var captor = org.mockito.ArgumentCaptor.forClass(
+      ProposalHandler.ProposeOptions.class);
+    verify(resource.proposalHandler).propose(any(), any(), captor.capture());
+    assertNull(captor.getValue().reviewerFilter(),
+      "a small group-free approver set must not be narrowed");
+
+    // Cheap-path guarantee: no Cloud Identity round-trips for the
+    // common small-team case.
+    verifyNoInteractions(resource.groupsClient);
+  }
+
+  /**
+   * SECOP-952 core fix: on an empty selection, when the approver set is
+   * large enough to be a broadcast, narrow to the requester's suggested
+   * teammates rather than DMing the whole set. Here two of the many
+   * direct approvers share a small group with the requester, so propose
+   * receives exactly those two.
+   */
+  @Test
+  public void post_whenNoReviewersPickedAndTeammatesExist_narrowsToSuggested()
+    throws Exception {
+    var teamMate1 = new EndUserId("teammate-1@example.com");
+    var teamMate2 = new EndUserId("teammate-2@example.com");
+
+    // A broad, group-free approver set (> AUTO_NARROW_BROADCAST_LIMIT)
+    // so the auto-narrow path engages.
+    var acl = new AccessControlList.Builder()
+      .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+      .allow(teamMate1, PolicyPermission.APPROVE_OTHERS.toMask())
+      .allow(teamMate2, PolicyPermission.APPROVE_OTHERS.toMask());
+    for (int i = 0; i < 20; i++) {
+      acl.allow(new EndUserId("approver-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      acl.build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        "token", Set.of(teamMate1), Instant.MAX));
+
+    // The requester shares one small team group with teamMate1/2.
+    var teamGroup = new GroupId("team@example.com");
+    when(resource.groupsClient.listMembershipsByUser(eq(SAMPLE_USER)))
+      .thenReturn(List.of(new MembershipRelation()
+        .setGroupKey(new EntityKey().setId(teamGroup.email))));
+    when(resource.groupsClient.listMemberships(eq(teamGroup)))
+      .thenReturn(List.of(
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId(teamMate1.email)),
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId(teamMate2.email))));
+
+    resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      new MultivaluedHashMap<>());
+
+    var captor = org.mockito.ArgumentCaptor.forClass(
+      ProposalHandler.ProposeOptions.class);
+    verify(resource.proposalHandler).propose(any(), any(), captor.capture());
+    assertEquals(
+      Set.of(teamMate1, teamMate2),
+      captor.getValue().reviewerFilter(),
+      "empty selection on a broad set must narrow to suggested teammates");
+  }
+
+  /**
+   * SECOP-952 safety net: on an empty selection, when the approver set
+   * is large AND the requester shares no team with anyone, we refuse to
+   * broadcast — the submission is rejected so the requester picks at
+   * least one reviewer. propose is never reached.
+   */
+  @Test
+  public void post_whenNoReviewersPickedAndNoTeammates_rejectsRatherThanBroadcast()
+    throws Exception {
+    var acl = new AccessControlList.Builder()
+      .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask());
+    for (int i = 0; i < 20; i++) {
+      acl.allow(new EndUserId("approver-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      acl.build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    // Requester shares no group with anyone → no suggestions.
+    when(resource.groupsClient.listMembershipsByUser(any()))
+      .thenReturn(List.of());
+
+    assertThrows(
+      jakarta.ws.rs.BadRequestException.class,
+      () -> resource.post(
+        group.id().environment(),
+        group.id().system(),
+        group.id().name(),
+        new MultivaluedHashMap<>()));
+
+    verify(resource.proposalHandler, never()).propose(any(), any(), any());
   }
 
   //---------------------------------------------------------------------------

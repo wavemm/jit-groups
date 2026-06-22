@@ -172,13 +172,24 @@ public class GroupsResource {
         inputValues.remove(FIELD_NOTIFY_REVIEWERS));
 
       //
-      // When the requester picked specific reviewers, validate every
-      // email is in the expanded qualified-peer set BEFORE calling
-      // propose. JoinOperation.propose trusts the filter is already
-      // an authorised subset (it short-circuits the recipients list
-      // to whatever we pass), so the security check needs to happen
-      // here where we have a GroupResolver to expand groups.
+      // Resolve the *effective* reviewer filter handed to
+      // JoinOperation.propose (ProposeOptions.reviewerFilter):
       //
+      //  - Requester picked reviewers → validate every email is in the
+      //    expanded qualified-peer set BEFORE calling propose.
+      //    JoinOperation.propose trusts the filter is already an
+      //    authorised subset (it short-circuits the recipients list to
+      //    whatever we pass), so the security check has to happen here
+      //    where we have a GroupResolver to expand groups.
+      //
+      //  - Requester picked nobody → auto-narrow (SECOP-952). Rather
+      //    than letting propose fall back to the entire policy ACL —
+      //    which, when it names a broad group like
+      //    engineering@roles.wave.com, expands to hundreds of Slack DMs
+      //    — narrow to the requester's suggested teammates. We never
+      //    broadcast to a large group on an empty selection.
+      //
+      Set<EndUserId> effectiveReviewers;
       if (selectedReviewers != null && !selectedReviewers.isEmpty()) {
         var qualified = group.policy().effectiveAccessControlList()
           .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
@@ -202,6 +213,10 @@ public class GroupsResource {
             "Selected reviewers are not authorised to approve this request: "
               + String.join(", ", rejected));
         }
+        effectiveReviewers = selectedReviewers;
+      }
+      else {
+        effectiveReviewers = autoNarrowedReviewers(group, groupId);
       }
 
       //
@@ -234,7 +249,7 @@ public class GroupsResource {
           joinOp,
           buildActionUri,
           new ProposalHandler.ProposeOptions(
-            selectedReviewers,
+            effectiveReviewers,
             notifyReviewers));
 
         // Plumb the notifyReviewers flag into the audit event so the
@@ -368,6 +383,122 @@ public class GroupsResource {
     }
     // Last value wins (browsers may submit duplicates from a checkbox).
     return Boolean.parseBoolean(raw.get(raw.size() - 1));
+  }
+
+  /**
+   * Largest expanded approver set we'll DM in full on an empty picker
+   * selection (SECOP-952). At or below this many individual reviewers,
+   * "notify everyone" is a small-team broadcast and stays the upstream
+   * default; above it — with no teammate to narrow to — we refuse to
+   * broadcast and require an explicit pick instead.
+   *
+   * <p>Sized to a generous single team: Wave teams are typically &lt;15
+   * (see {@link ReviewerCandidates#SUGGESTION_GROUP_MAX_SIZE}), so a set
+   * larger than this almost always means a broad group like
+   * {@code engineering@} crept into the ACL.
+   */
+  static final int AUTO_NARROW_BROADCAST_LIMIT = 15;
+
+  /**
+   * Compute the reviewer filter for an empty picker selection
+   * (SECOP-952). The requester didn't pick anyone, so instead of
+   * letting {@link JitGroupContext.JoinOperation#propose} fall back to
+   * the entire policy ACL — which DMs every member of any group in it —
+   * we narrow to the requester's likely teammates.
+   *
+   * <p>Returns:
+   * <ul>
+   *   <li>{@code null} — no narrowing; {@code propose} uses the full
+   *       policy ACL. Used when the approver set is small and contains
+   *       no group, i.e. a handful of named individuals where DMing
+   *       everyone isn't "loud". This path makes no Cloud Identity
+   *       calls.
+   *   <li>a non-empty subset — the requester's suggested teammates
+   *       ({@link ReviewerCandidates.Candidate#suggested()}), used when
+   *       the ACL contains a group (or many direct approvers) so we
+   *       avoid broadcasting to the whole group.
+   * </ul>
+   *
+   * <p>Throws {@link BadRequestException} when the approver set is large
+   * AND no teammate can be auto-selected: we won't silently DM everyone,
+   * so we ask the requester to pick at least one reviewer. That is the
+   * only case an empty selection is rejected — it preserves the
+   * "never broadcast to a large group" guarantee without forcing a pick
+   * in the common small-team / clear-teammate cases. The same
+   * fail-safe applies if teammate resolution errors out (Cloud Identity
+   * outage / permission gap): we'd rather ask for a pick than broadcast.
+   */
+  private @Nullable Set<EndUserId> autoNarrowedReviewers(
+    @NotNull JitGroupContext group,
+    @NotNull JitGroupId groupId
+  ) {
+    var rawApprovers = group.policy().effectiveAccessControlList()
+      .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
+      .stream()
+      .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
+      .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
+      .collect(Collectors.toSet());
+
+    var hasGroupApprover = rawApprovers.stream()
+      .anyMatch(com.google.solutions.jitaccess.auth.GroupId.class::isInstance);
+
+    //
+    // Cheap guard: no group in the ACL and only a few named approvers →
+    // DMing all of them is not a broad broadcast. Keep the upstream
+    // DM-everyone behaviour and skip the Cloud Identity round-trips
+    // entirely (this also keeps no-approval / no-approver flows from
+    // touching the groups client at all).
+    //
+    if (rawApprovers.isEmpty()
+      || (!hasGroupApprover && rawApprovers.size() <= AUTO_NARROW_BROADCAST_LIMIT)) {
+      return null;
+    }
+
+    var requester = this.subject.user();
+    var qualified = rawApprovers.stream()
+      .filter(p -> !p.equals(requester))
+      .collect(Collectors.toCollection(HashSet::new));
+
+    List<ReviewerCandidates.Candidate> candidates;
+    try {
+      var resolver = new GroupResolver(this.groupsClient, this.executor);
+      candidates = new ReviewerCandidates(resolver, this.groupsClient, this.executor)
+        .compute(requester, qualified);
+    }
+    catch (com.google.solutions.jitaccess.apis.clients.AccessException
+      | java.io.IOException e) {
+      // Fail safe = never broadcast. If teammates can't be computed,
+      // don't silently DM the whole group — require an explicit pick.
+      this.logger.warn(
+        EventIds.API_JOIN_GROUP,
+        "Auto-narrow of reviewers failed for %s on %s; requiring an "
+          + "explicit selection rather than broadcasting. cause=%s",
+        requester.email, groupId, e);
+      throw new BadRequestException(
+        "Couldn't determine close-team reviewers automatically. Please "
+          + "select at least one reviewer for this request.");
+    }
+
+    var suggested = candidates.stream()
+      .filter(ReviewerCandidates.Candidate::suggested)
+      .map(c -> new EndUserId(c.email()))
+      .collect(Collectors.toSet());
+
+    if (!suggested.isEmpty()) {
+      return suggested;
+    }
+
+    //
+    // No teammate signal at all. If the expanded set is still small,
+    // DMing everyone is acceptable; otherwise refuse to broadcast.
+    //
+    if (candidates.size() <= AUTO_NARROW_BROADCAST_LIMIT) {
+      return null;
+    }
+    throw new BadRequestException(
+      "This role's approver list expands to " + candidates.size()
+        + " people and none share a team with you. Please pick at least "
+        + "one reviewer so we don't notify everyone.");
   }
 
   /**
