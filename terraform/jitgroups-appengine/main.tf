@@ -260,10 +260,13 @@ resource "google_iap_brand" "iap_brand" {
     project                    = var.project_id
     support_email              = var.admin_email
     application_title          = "JIT Groups"
-    # lifecycle {
-    #     # This resource can't be deleted.
-    #     prevent_destroy = true
-    # }
+    lifecycle {
+        # Brands cannot be deleted or recreated (one per project, and the
+        # IAP OAuth Admin API is deprecated). A support_email change forces
+        # replacement, which first deletes the dependent IAP client and
+        # breaks all logins (2026-07-07 outage). Fail the plan instead.
+        prevent_destroy = true
+    }
 }
 
 #
@@ -272,6 +275,12 @@ resource "google_iap_brand" "iap_brand" {
 resource "google_iap_client" "iap_client" {
     display_name               = "JIT Groups"
     brand                      = google_iap_brand.iap_brand.name
+
+    # Never delete the live OAuth client through the API: App Engine IAP
+    # keeps referencing it and every login fails with `deleted_client`
+    # (2026-07-07 outage). On destroy/replace, only remove it from state
+    # and leave the client running in GCP.
+    deletion_policy            = "ABANDON"
 }
 
 #
