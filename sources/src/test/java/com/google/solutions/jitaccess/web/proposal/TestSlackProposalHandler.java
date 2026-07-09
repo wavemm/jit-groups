@@ -231,7 +231,7 @@ public class TestSlackProposalHandler {
   // -------------------------------------------------------------------------
 
   @Test
-  public void onProposalApproved_updatesSiblingsButNotApprover() throws Exception {
+  public void onProposalApproved_updatesSiblingsAndApproverDistinctly() throws Exception {
     var slack = slackClientHappyPath();
     var registry = mock(SlackMessageRegistry.class);
     var entries = List.of(
@@ -255,9 +255,18 @@ public class TestSlackProposalHandler {
       approval,
       proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL)));
 
-    // Carol's DM gets updated; Bob's does NOT (he just approved).
-    verify(slack).updateMessage(eq("C-CAROL"), eq("222.222"), anyList(), anyString());
-    verify(slack, never()).updateMessage(eq("C-BOB"), anyString(), anyList(), anyString());
+    // Carol (sibling) gets the "already approved by X" update; Bob (the
+    // approver) gets the SECOP-1094 "you approved this" variant — both
+    // DMs are updated, with distinct fallback texts.
+    var carolFallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-CAROL"), eq("222.222"), anyList(), carolFallback.capture());
+    assertTrue(carolFallback.getValue().contains("Already approved by bob@example.com"));
+
+    var bobFallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-BOB"), eq("111.111"), anyList(), bobFallback.capture());
+    assertTrue(bobFallback.getValue().contains("You approved alice@example.com"));
 
     // Beneficiary (Alice) gets a confirmation DM.
     verify(slack).lookupUserByEmail(eq("alice@example.com"));
@@ -265,6 +274,40 @@ public class TestSlackProposalHandler {
 
     // Registry entry deleted after handling.
     verify(registry).delete(anyString());
+  }
+
+  /**
+   * SECOP-1094 regression: when the approver was the ONLY recipient
+   * (picked-single-reviewer flow), their DM previously received no
+   * update at all — which looked like the approval hadn't worked.
+   */
+  @Test
+  public void onProposalApproved_soleRecipientApproverStillGetsUpdate() throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    var entries = List.of(
+      new SlackMessageRegistry.ReviewerMessage(
+        "bob@example.com", "U-BOB", "C-BOB", "111.111"));
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("test-fingerprint-key");
+    when(registry.lookup(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(Optional.of(entries)));
+    when(registry.delete(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var approval = mock(JitGroupContext.ApprovalOperation.class);
+    when(approval.user()).thenReturn(BOB);
+
+    handler.onProposalApproved(
+      approval,
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)));
+
+    var fallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-BOB"), eq("111.111"), anyList(), fallback.capture());
+    assertTrue(fallback.getValue().contains("You approved alice@example.com"));
   }
 
   @Test

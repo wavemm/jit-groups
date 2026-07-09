@@ -53,8 +53,10 @@ import java.util.concurrent.Semaphore;
  * <p>Flow on {@link #onProposalApproved}:
  * <ol>
  *   <li>Look up the registry entry by request key.
- *   <li>For each non-approver sibling, {@code chat.update} the original DM
- *       to "Already approved by X — no action needed".
+ *   <li>{@code chat.update} every recorded DM in place: non-approver
+ *       siblings get "Already approved by X — no action needed", the
+ *       approver's own message gets "You approved this request"
+ *       (SECOP-1094).
  *   <li>DM the beneficiary "Your elevation was approved by X".
  *   <li>Delete the registry entry.
  * </ol>
@@ -400,21 +402,29 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     var siblingBlocks = SlackMessages.reviewerSiblingUpdate(
       fp.beneficiary(), fp.groupId(), approverEmail);
     var siblingFallback = SlackMessages.reviewerSiblingUpdateFallback(approverEmail);
+    // SECOP-1094: the approver's own DM gets a distinct "you approved
+    // this" update instead of being skipped — leaving it frozen (with a
+    // stale action link) reads as a failure, especially when the
+    // approver was the only recipient and no sibling update happens.
+    var approverBlocks = SlackMessages.reviewerApprovedByYou(
+      fp.beneficiary(), fp.groupId());
+    var approverFallback = SlackMessages.reviewerApprovedByYouFallback(fp.beneficiary());
 
     for (var entry : entriesOpt.get()) {
-      if (entry.email().equalsIgnoreCase(approverEmail)) {
-        // The approver doesn't need a "you approved" update — they did it.
-        continue;
-      }
+      var isApprover = entry.email().equalsIgnoreCase(approverEmail);
       try {
         this.slackClient.updateMessage(
-          entry.channelId(), entry.messageTs(), siblingBlocks, siblingFallback).join();
+          entry.channelId(),
+          entry.messageTs(),
+          isApprover ? approverBlocks : siblingBlocks,
+          isApprover ? approverFallback : siblingFallback).join();
       }
       catch (RuntimeException e) {
         var cause = e.getCause() != null ? e.getCause() : e;
         this.logger.warn(
           "slack.siblingUpdate.failed",
-          "Failed to chat.update sibling DM %s/%s for %s: %s",
+          "Failed to chat.update %s DM %s/%s for %s: %s",
+          isApprover ? "approver" : "sibling",
           entry.channelId(), entry.messageTs(), entry.email(), cause.getMessage());
       }
     }
@@ -430,8 +440,8 @@ public class SlackProposalHandler extends AbstractProposalHandler {
 
     this.logger.info(
       "slack.onProposalApproved",
-      "Updated %d sibling DM(s) for approved request key=%s (approver=%s)",
-      Math.max(0, entriesOpt.get().size() - 1), fp.key(), approverEmail);
+      "Updated %d reviewer DM(s) for approved request key=%s (approver=%s)",
+      entriesOpt.get().size(), fp.key(), approverEmail);
   }
 
   private void notifyBeneficiary(
