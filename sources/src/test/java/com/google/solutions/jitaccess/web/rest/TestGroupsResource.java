@@ -734,6 +734,89 @@ public class TestGroupsResource {
   }
 
   /**
+   * SECOP-952 follow-up: the auto-picked teammate set is capped at
+   * AUTO_NARROW_TEAMMATE_CAP (5) even when more teammates exist — the
+   * first production broad-role request auto-picked 15 and that was
+   * still too loud. Higher-affinity teammates (more shared small
+   * groups) win the cut.
+   */
+  @Test
+  public void post_whenManyTeammates_capsAutoPickAtFiveClosest()
+    throws Exception {
+    GroupsResource.clearReviewerRateLimiters();
+
+    // 8 teammates; three of them share TWO small groups with the
+    // requester (higher affinity), five share one. A broad group-free
+    // ACL pushes the request onto the auto-narrow path.
+    var acl = new AccessControlList.Builder()
+      .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask());
+    for (int i = 0; i < 8; i++) {
+      acl.allow(new EndUserId("teammate-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    for (int i = 0; i < 20; i++) {
+      acl.allow(new EndUserId("approver-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      acl.build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
+
+    var teamA = new GroupId("team-a@example.com");   // all 8 teammates
+    var teamB = new GroupId("team-b@example.com");   // teammates 5..7 only
+    when(resource.groupsClient.listMembershipsByUser(eq(SAMPLE_USER)))
+      .thenReturn(List.of(
+        new MembershipRelation().setGroupKey(new EntityKey().setId(teamA.email)),
+        new MembershipRelation().setGroupKey(new EntityKey().setId(teamB.email))));
+    var teamAMembers = new java.util.ArrayList<Membership>();
+    for (int i = 0; i < 8; i++) {
+      teamAMembers.add(new Membership().setType("user")
+        .setPreferredMemberKey(new EntityKey().setId("teammate-" + i + "@example.com")));
+    }
+    when(resource.groupsClient.listMemberships(eq(teamA))).thenReturn(teamAMembers);
+    when(resource.groupsClient.listMemberships(eq(teamB)))
+      .thenReturn(List.of(
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId("teammate-5@example.com")),
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId("teammate-6@example.com")),
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId("teammate-7@example.com"))));
+
+    resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      new MultivaluedHashMap<>());
+
+    var captor = org.mockito.ArgumentCaptor.forClass(
+      ProposalHandler.ProposeOptions.class);
+    verify(resource.proposalHandler).propose(any(), any(), captor.capture());
+    var picked = captor.getValue().reviewerFilter();
+    assertEquals(GroupsResource.AUTO_NARROW_TEAMMATE_CAP, picked.size(),
+      "auto-pick must stop at the teammate cap");
+    // The three double-affinity teammates must all make the cut; the
+    // remaining two slots go to single-affinity teammates.
+    assertTrue(picked.contains(new EndUserId("teammate-5@example.com")));
+    assertTrue(picked.contains(new EndUserId("teammate-6@example.com")));
+    assertTrue(picked.contains(new EndUserId("teammate-7@example.com")));
+  }
+
+  /**
    * SECOP-952 safety net: on an empty selection, when the approver set
    * is large AND the requester shares no team with anyone, we refuse to
    * broadcast — the submission is rejected so the requester picks at

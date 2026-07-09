@@ -407,18 +407,32 @@ public class GroupsResource {
    * and — with no teammate to narrow to — refuse to broadcast and
    * require an explicit pick instead.
    *
-   * <p>Also caps how many teammates the auto-narrowed filter itself
-   * carries. Deliberately distinct from {@link
-   * ReviewerCandidates#SUGGESTED_BADGE_TOP_N}, which is a UI
-   * presentation cap: tying the DM audience to the badge would let a
-   * cosmetic tweak silently change production notification fan-out.
-   *
    * <p>Sized to a generous single team: Wave teams are typically &lt;15
    * (see {@link ReviewerCandidates#SUGGESTION_GROUP_MAX_SIZE}), so a set
    * larger than this almost always means a broad group like
-   * {@code engineering@} crept into the ACL.
+   * {@code engineering@} crept into the ACL. Note this tolerance applies
+   * to approvers the policy names explicitly (or a no-teammate-signal
+   * fallback); the AUTO-PICKED teammate set has its own, much smaller
+   * cap — {@link #AUTO_NARROW_TEAMMATE_CAP}.
    */
   static final int AUTO_NARROW_BROADCAST_LIMIT = 15;
+
+  /**
+   * Maximum number of teammates the auto-narrow picks on the
+   * requester's behalf (SECOP-952 follow-up). Candidates are ranked by
+   * team affinity, so this is "your {@value} closest colleagues" — the
+   * first production broad-role request auto-picked 15 and that was
+   * still judged too loud; when nobody is picked explicitly, a handful
+   * of close teammates is the intent, not a mid-sized broadcast.
+   *
+   * <p>Deliberately distinct from {@link
+   * ReviewerCandidates#SUGGESTED_BADGE_TOP_N} (a UI presentation cap:
+   * tying the DM audience to the badge would let a cosmetic tweak
+   * silently change production notification fan-out) and from
+   * {@link #AUTO_NARROW_BROADCAST_LIMIT} (the tolerance for DMing an
+   * explicitly-named small approver set in full).
+   */
+  static final int AUTO_NARROW_TEAMMATE_CAP = 5;
 
   /**
    * Compute the reviewer filter for an empty picker selection on a
@@ -442,7 +456,7 @@ public class GroupsResource {
    *   <li>a non-empty subset — the requester's teammates
    *       ({@link ReviewerCandidates.Candidate#teammate()}, i.e.
    *       sharing at least one small group), highest-affinity first,
-   *       capped at {@link #AUTO_NARROW_BROADCAST_LIMIT}. Used when
+   *       capped at {@link #AUTO_NARROW_TEAMMATE_CAP}. Used when
    *       the ACL contains a group (or many direct approvers) so we
    *       avoid broadcasting to the whole group.
    * </ul>
@@ -550,16 +564,16 @@ public class GroupsResource {
     }
 
     //
-    // Teammates = every candidate sharing at least one small group
-    // with the requester, in affinity order (compute() ranks them
-    // score-first). NOT the `suggested` badge: that is capped at
-    // ReviewerCandidates.SUGGESTED_BADGE_TOP_N for presentation, and
-    // an audience of 3 is fragile — a couple of OOO or offboarded
-    // teammates would strand the request.
+    // Teammates = candidates sharing at least one small group with the
+    // requester, in affinity order (compute() ranks them score-first),
+    // capped at the requester's AUTO_NARROW_TEAMMATE_CAP closest. NOT
+    // the `suggested` badge (a presentation cap), and deliberately a
+    // few rather than one — a couple of OOO or offboarded teammates
+    // must not strand the request.
     //
     var teammates = candidates.stream()
       .filter(ReviewerCandidates.Candidate::teammate)
-      .limit(AUTO_NARROW_BROADCAST_LIMIT)
+      .limit(AUTO_NARROW_TEAMMATE_CAP)
       .map(c -> new EndUserId(c.email()))
       .collect(Collectors.toSet());
 
