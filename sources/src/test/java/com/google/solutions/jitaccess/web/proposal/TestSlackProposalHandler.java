@@ -11,6 +11,7 @@
 package com.google.solutions.jitaccess.web.proposal;
 
 import com.google.solutions.jitaccess.apis.Logger;
+import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
 import com.google.solutions.jitaccess.auth.EndUserId;
 import com.google.solutions.jitaccess.auth.GroupResolver;
 import com.google.solutions.jitaccess.auth.IamPrincipalId;
@@ -231,7 +232,7 @@ public class TestSlackProposalHandler {
   // -------------------------------------------------------------------------
 
   @Test
-  public void onProposalApproved_updatesSiblingsButNotApprover() throws Exception {
+  public void onProposalApproved_updatesSiblingsAndApproverDistinctly() throws Exception {
     var slack = slackClientHappyPath();
     var registry = mock(SlackMessageRegistry.class);
     var entries = List.of(
@@ -255,9 +256,18 @@ public class TestSlackProposalHandler {
       approval,
       proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL)));
 
-    // Carol's DM gets updated; Bob's does NOT (he just approved).
-    verify(slack).updateMessage(eq("C-CAROL"), eq("222.222"), anyList(), anyString());
-    verify(slack, never()).updateMessage(eq("C-BOB"), anyString(), anyList(), anyString());
+    // Carol (sibling) gets the "already approved by X" update; Bob (the
+    // approver) gets the SECOP-1094 "you approved this" variant — both
+    // DMs are updated, with distinct fallback texts.
+    var carolFallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-CAROL"), eq("222.222"), anyList(), carolFallback.capture());
+    assertTrue(carolFallback.getValue().contains("Already approved by bob@example.com"));
+
+    var bobFallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-BOB"), eq("111.111"), anyList(), bobFallback.capture());
+    assertTrue(bobFallback.getValue().contains("You approved alice@example.com"));
 
     // Beneficiary (Alice) gets a confirmation DM.
     verify(slack).lookupUserByEmail(eq("alice@example.com"));
@@ -265,6 +275,40 @@ public class TestSlackProposalHandler {
 
     // Registry entry deleted after handling.
     verify(registry).delete(anyString());
+  }
+
+  /**
+   * SECOP-1094 regression: when the approver was the ONLY recipient
+   * (picked-single-reviewer flow), their DM previously received no
+   * update at all — which looked like the approval hadn't worked.
+   */
+  @Test
+  public void onProposalApproved_soleRecipientApproverStillGetsUpdate() throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    var entries = List.of(
+      new SlackMessageRegistry.ReviewerMessage(
+        "bob@example.com", "U-BOB", "C-BOB", "111.111"));
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("test-fingerprint-key");
+    when(registry.lookup(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(Optional.of(entries)));
+    when(registry.delete(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var approval = mock(JitGroupContext.ApprovalOperation.class);
+    when(approval.user()).thenReturn(BOB);
+
+    handler.onProposalApproved(
+      approval,
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)));
+
+    var fallback = org.mockito.ArgumentCaptor.forClass(String.class);
+    verify(slack).updateMessage(
+      eq("C-BOB"), eq("111.111"), anyList(), fallback.capture());
+    assertTrue(fallback.getValue().contains("You approved alice@example.com"));
   }
 
   @Test
@@ -334,6 +378,109 @@ public class TestSlackProposalHandler {
   // ---------------------------------------------------------------------
   // Options — fan-out concurrency cap (wavemm fork P1-4)
   // ---------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // verifyNotConsumed / markConsumed (SECOP-1093).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void verifyNotConsumed_rejectsConsumedProposal() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(eq("consumption-key")))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    assertThrows(
+      AccessDeniedException.class,
+      () -> handler.verifyNotConsumed(proposal));
+  }
+
+  @Test
+  public void verifyNotConsumed_allowsFreshProposal() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(eq("consumption-key")))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.verifyNotConsumed(proposal);  // must not throw
+  }
+
+  @Test
+  public void verifyNotConsumed_skipsProposalsWithoutId() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    // proposalFor leaves Proposal#id unstubbed → null (no jti).
+    handler.verifyNotConsumed(proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)));
+
+    verify(registry, never()).isProposalConsumed(anyString());
+  }
+
+  /**
+   * SECOP-1093: consumption is anti-replay defense-in-depth, not the
+   * authorization itself — a Firestore outage must not block approvals.
+   */
+  @Test
+  public void verifyNotConsumed_failsOpenOnRegistryError() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(anyString()))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore unavailable")));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.verifyNotConsumed(proposal);  // must not throw
+  }
+
+  @Test
+  public void markConsumed_writesMarkerWithTokenExpiry() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.markProposalConsumed(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var expiry = Instant.now().plus(Duration.ofHours(1));
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+    when(proposal.expiry()).thenReturn(expiry);
+
+    handler.markConsumed(proposal);
+
+    verify(registry).markProposalConsumed(eq("consumption-key"), eq(expiry));
+  }
+
+  @Test
+  public void markConsumed_swallowsRegistryErrors() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.markProposalConsumed(anyString(), any()))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore unavailable")));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.markConsumed(proposal);  // must not throw
+  }
 
   @Test
   public void options_singleArgConstructor_appliesDefaultFanOutCap() {

@@ -93,6 +93,32 @@ public interface ProposalHandler {
   ) throws AccessException;
 
   /**
+   * Wavemm fork (SECOP-1093): reject proposals whose token was already
+   * used to approve. Proposal tokens are stateless JWTs — without a
+   * consumption record, one approval link authorizes unlimited re-grants
+   * for the token lifetime (~1h), each resetting the membership clock.
+   *
+   * <p>The default is a no-op: handlers without a consumption store
+   * (mail, debug) keep the upstream replayable semantics. The Slack
+   * handler enforces via its Firestore registry.
+   *
+   * @throws AccessException when the proposal was already consumed
+   */
+  default void verifyNotConsumed(@NotNull Proposal proposal)
+    throws AccessException {
+  }
+
+  /**
+   * Wavemm fork (SECOP-1093): record that this proposal was used to
+   * approve, so subsequent {@link #verifyNotConsumed} calls reject it.
+   * Best-effort by contract — implementations must not fail the
+   * approval that just succeeded; a missed mark merely restores the
+   * upstream replayable behaviour for this one token.
+   */
+  default void markConsumed(@NotNull Proposal proposal) {
+  }
+
+  /**
    * Token that encodes all information about a proposal in a tamper-proof
    * way, suitable for exchanging in URLs and/or email messages.
    */

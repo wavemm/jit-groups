@@ -189,6 +189,24 @@ public class TestAbstractProposalHandler {
       () -> proposalHandler.accept("token"));
   }
 
+  /**
+   * SECOP-1093: accept() must surface the JWT jti as {@code Proposal.id()}
+   * so the consumption registry can key on it.
+   */
+  @Test
+  public void accept_exposesJwtIdAsProposalId() throws Exception {
+    var token = "{\"jti\":\"abc123\"," +
+      "\"rcp\":[\"user:user-2@example.com\"]," +
+      "\"grp\":\"jit-group:env.sys.group-1\"," +
+      "\"usr\":\"user:user-1@example.com\",\"inp\":{}}";
+
+    var signer = new PseudoSigner();
+    var proposalHandler = new SampleProposalHandler(signer);
+    var proposal = proposalHandler.accept(token);
+
+    assertEquals("abc123", proposal.id());
+  }
+
   @Test
   public void accept_whenInputEmpty() throws Exception {
     var token = "{\"rcp\":[\"user:user-2@example.com\",\"group:group@example.com\"]," +

@@ -503,4 +503,113 @@ public class TestProposalResource {
         "token",
         new MultivaluedHashMap<>()));
   }
+
+  //---------------------------------------------------------------------------
+  // Single-use proposals (wavemm fork, SECOP-1093).
+  //---------------------------------------------------------------------------
+
+  /**
+   * SECOP-1093: an already-consumed token must be rejected BEFORE the
+   * approval executes — no membership, no audit event, no re-mark.
+   */
+  @Test
+  public void post_whenProposalAlreadyConsumed_rejectsBeforeApproving()
+    throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new ProposalResource();
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.proposalHandler = createProposalHandler(
+      group.id(),
+      new EndUserId("other@example.com"),
+      Set.of(SAMPLE_USER));
+    doThrow(new AccessDeniedException("This approval link has already been used"))
+      .when(resource.proposalHandler).verifyNotConsumed(any(Proposal.class));
+
+    assertThrows(
+      AccessDeniedException.class,
+      () -> resource.post(
+        group.id().environment(),
+        "token",
+        new MultivaluedHashMap<>()));
+
+    verify(resource.auditTrail, never()).joinExecuted(
+      any(JitGroupContext.ApprovalOperation.class),
+      any(Principal.class));
+    verify(resource.proposalHandler, never()).markConsumed(any(Proposal.class));
+  }
+
+  /**
+   * SECOP-1093: the happy path checks consumption before approving and
+   * records consumption only after the approval succeeded.
+   */
+  @Test
+  public void post_whenApprovalSucceeds_marksProposalConsumed()
+    throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new ProposalResource();
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.proposalHandler = createProposalHandler(
+      group.id(),
+      new EndUserId("other@example.com"),
+      Set.of(SAMPLE_USER));
+
+    resource.post(
+      group.id().environment(),
+      "token",
+      new MultivaluedHashMap<>());
+
+    var order = inOrder(resource.proposalHandler, resource.auditTrail);
+    order.verify(resource.proposalHandler).verifyNotConsumed(any(Proposal.class));
+    order.verify(resource.auditTrail).joinExecuted(
+      any(JitGroupContext.ApprovalOperation.class),
+      any(Principal.class));
+    order.verify(resource.proposalHandler).markConsumed(any(Proposal.class));
+  }
+
+  /**
+   * SECOP-1093: viewing an already-used link fails like an expired one,
+   * instead of rendering an approval page whose submit would then fail.
+   */
+  @Test
+  public void get_whenProposalAlreadyConsumed_rejects() throws Exception {
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      new AccessControlList.Builder()
+        .allow(SAMPLE_USER, PolicyPermission.APPROVE_OTHERS.toMask())
+        .build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new ProposalResource();
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.proposalHandler = createProposalHandler(
+      group.id(),
+      new EndUserId("other@example.com"),
+      Set.of(SAMPLE_USER));
+    doThrow(new AccessDeniedException("This approval link has already been used"))
+      .when(resource.proposalHandler).verifyNotConsumed(any(Proposal.class));
+
+    assertThrows(
+      AccessDeniedException.class,
+      () -> resource.get(
+        group.id().environment(),
+        "token"));
+  }
 }

@@ -207,6 +207,13 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
       }
 
       @Override
+      public String id() {
+        // The jti minted at propose-time: 6 crypto-random bytes, base64.
+        // Anchors single-use consumption tracking (SECOP-1093).
+        return payload.getJwtId();
+      }
+
+      @Override
       public @NotNull JitGroupId group() {
         return group;
       }
