@@ -208,6 +208,35 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "No qualified reviewers resolved to individual users for " + fp.groupId());
     }
 
+    //
+    // SECOP-1097: skip the fan-out if an equivalent request is already
+    // in flight. The registry key is (beneficiary, group, recipients),
+    // so a live entry means the same person already has reviewer DMs
+    // out for the same group+reviewers — a duplicate submit (multi-tab,
+    // or a retry after a slow first POST). Re-sending would double every
+    // reviewer's DMs and leave a second approvable token dangling.
+    // Fail-open: a registry read error falls through to the normal
+    // fan-out (a duplicate DM batch beats dropping a real request).
+    //
+    try {
+      if (this.registry.lookup(fp.key()).join().isPresent()) {
+        this.logger.info(
+          "slack.onOperationProposed.duplicateSkipped",
+          "A live proposal already exists for %s requesting %s (key=%s); "
+            + "skipping duplicate reviewer notification.",
+          fp.beneficiary(), fp.groupId(), fp.key());
+        return;
+      }
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.warn(
+        "slack.duplicateCheck.failed",
+        "Duplicate-proposal check failed for %s on %s; proceeding with "
+          + "notification (fail-open). cause=%s",
+        fp.beneficiary(), fp.groupId(), cause.getMessage());
+    }
+
     var justification = proposal.input().getOrDefault("justification", "");
 
     var blocks = SlackMessages.reviewRequest(

@@ -406,7 +406,20 @@
                 this.formFields = []
                 this.form = this.select('form');
 
-                this.select('button[type="submit"]').unbind('click').click(async () => {
+                // SECOP-1097: guard against double-submit. The POST is slow
+                // on broad roles (Cloud Identity fan-out + reviewer DMs), and
+                // an impatient second click used to mint a second proposal
+                // token and a duplicate reviewer DM batch. Ignore re-entrant
+                // clicks and disable the button while the request is in flight.
+                this._submitting = false;
+                const submitButton = this.select('button[type="submit"]');
+                submitButton.unbind('click').click(async () => {
+                    if (this._submitting) {
+                        return;
+                    }
+                    this._submitting = true;
+                    submitButton.prop('disabled', true);
+
                     var dialog = new WaitDialog();
                     dialog.showAsync();
 
@@ -418,6 +431,8 @@
                     }
                     finally {
                         dialog.close();
+                        this._submitting = false;
+                        submitButton.prop('disabled', false);
                     }
                 });
             }

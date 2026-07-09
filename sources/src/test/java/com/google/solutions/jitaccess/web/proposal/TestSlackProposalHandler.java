@@ -380,6 +380,64 @@ public class TestSlackProposalHandler {
   // ---------------------------------------------------------------------
 
   // -------------------------------------------------------------------------
+  // Duplicate-proposal skip (SECOP-1097).
+  // -------------------------------------------------------------------------
+
+  /**
+   * SECOP-1097: if a live registry entry already exists for the same
+   * (beneficiary, group, recipients), the fan-out is skipped — no
+   * duplicate reviewer DMs on a double-submit.
+   */
+  @Test
+  public void onOperationProposed_whenLiveEntryExists_skipsFanOut()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("dup-key");
+    when(registry.lookup(eq("dup-key")))
+      .thenReturn(CompletableFuture.completedFuture(Optional.of(List.of(
+        new SlackMessageRegistry.ReviewerMessage(
+          "bob@example.com", "U-BOB", "C-BOB", "111.111")))));
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var recipients = Set.<IamPrincipalId>of(BOB, CAROL);
+    handler.onOperationProposed(
+      operationFor(ALICE), proposalFor(ALICE, recipients),
+      tokenFor(recipients), ACTION_URI);
+
+    // No DMs posted, no new registry write.
+    verify(slack, never()).postDirectMessage(anyString(), anyList(), anyString());
+    verify(registry, never()).record(anyString(), anyList(), any());
+  }
+
+  /**
+   * SECOP-1097 fail-open: a registry read error must not drop a real
+   * request — the fan-out proceeds.
+   */
+  @Test
+  public void onOperationProposed_whenDuplicateCheckErrors_proceeds()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("k");
+    when(registry.lookup(eq("k")))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore down")));
+    when(registry.record(anyString(), anyList(), any()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var recipients = Set.<IamPrincipalId>of(BOB);
+    handler.onOperationProposed(
+      operationFor(ALICE), proposalFor(ALICE, recipients),
+      tokenFor(recipients), ACTION_URI);
+
+    verify(slack, atLeastOnce()).postDirectMessage(anyString(), anyList(), anyString());
+  }
+
+  // -------------------------------------------------------------------------
   // Requester visibility on auto-selected reviewers (SECOP-1099).
   // -------------------------------------------------------------------------
 
