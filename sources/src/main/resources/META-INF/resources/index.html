@@ -745,7 +745,8 @@
                             <span class="jit-reviewer-picker-hint">
                                 — pick one or more teammates (those tagged
                                 <strong>team</strong> are likely on yours).
-                                Leave all unchecked to notify every qualified peer.
+                                Leave all unchecked to notify your closest
+                                qualified teammates automatically.
                             </span>
                         </div>
                         <input type="search"
@@ -779,10 +780,11 @@
                         .attr('name', 'selectedReviewers')
                         .attr('value', c.email || '');
                     // Default unchecked even for suggested. The picker is
-                    // an opt-in narrowing tool: an untouched form must
-                    // continue to mean "notify every qualified peer", same
-                    // as before the picker existed. The badge remains as
-                    // a visual hint of who likely makes a good reviewer.
+                    // an opt-in narrowing tool: an untouched form means
+                    // "let the server pick" — since SECOP-952 that is the
+                    // requester's closest teammates (small approver sets
+                    // still notify everyone). The badge remains a visual
+                    // hint of who likely makes a good reviewer.
                     const display = $('<span>')
                         .addClass('jit-reviewer-display')
                         .text(c.displayName || c.email || '');
@@ -852,8 +854,9 @@
                         .addClass('jit-reviewer-picker-hint')
                         .text(
                             'Couldn\'t load the list of qualified reviewers ' +
-                            '(Cloud Identity API hiccup). Submitting will fall ' +
-                            'back to notifying every qualified peer per the policy.'));
+                            '(Cloud Identity API hiccup). You can still submit — ' +
+                            'reviewers are chosen automatically server-side, or ' +
+                            'you may be asked to retry once suggestions are back.'));
                 form.append(notice);
             }
 

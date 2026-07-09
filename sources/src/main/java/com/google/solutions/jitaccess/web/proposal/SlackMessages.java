@@ -167,6 +167,34 @@ final class SlackMessages {
   }
 
   /**
+   * Replaces the approver's OWN request DM after they approve
+   * (SECOP-1094). Without this the approver's message keeps its stale
+   * action link and nothing on their screen acknowledges the approval —
+   * in the picked-single-reviewer flow that reads as "did that even
+   * work?". The action link is removed, same as the sibling update.
+   */
+  static List<LayoutBlock> reviewerApprovedByYou(
+    @NotNull String requesterEmail,
+    @NotNull String groupId
+  ) {
+    return List.of(
+      HeaderBlock.builder()
+        .text(plain(":white_check_mark: You approved this request"))
+        .build(),
+      SectionBlock.builder()
+        .fields(List.of(
+          markdownField("*Requester*", "<mailto:" + requesterEmail + "|" + requesterEmail + ">"),
+          markdownField("*Group*", "`" + groupId + "`")
+        ))
+        .build(),
+      ContextBlock.builder()
+        .elements(List.of(markdown(
+          ":information_source: Nothing more to do — the requester has "
+            + "been notified.")))
+        .build());
+  }
+
+  /**
    * DM to the beneficiary confirming the activation completed.
    */
   static List<LayoutBlock> beneficiaryApproved(
@@ -200,6 +228,10 @@ final class SlackMessages {
 
   static String reviewerSiblingUpdateFallback(@NotNull String approverEmail) {
     return "Already approved by " + approverEmail + " — no action needed.";
+  }
+
+  static String reviewerApprovedByYouFallback(@NotNull String requesterEmail) {
+    return "You approved " + requesterEmail + "'s request — nothing more to do.";
   }
 
   static String beneficiaryApprovedFallback(@NotNull String groupId, @NotNull String approverEmail) {

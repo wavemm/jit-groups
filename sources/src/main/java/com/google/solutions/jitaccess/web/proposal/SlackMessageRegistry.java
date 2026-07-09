@@ -56,6 +56,7 @@ public class SlackMessageRegistry {
   static final String COLLECTION = "requests";
   static final String FIELD_REVIEWERS = "reviewers";
   static final String FIELD_EXPIRES_AT = "expires_at";
+  static final String FIELD_CONSUMED = "consumed";
 
   private final @NotNull Firestore firestore;
   private final @NotNull Executor executor;
@@ -131,6 +132,21 @@ public class SlackMessageRegistry {
       beneficiary,
       groupId,
       String.join(",", sorted));
+    return hmacHex(canonical);
+  }
+
+  /**
+   * Key of the consumption marker for a proposal JWT (SECOP-1093).
+   * Namespaced with a prefix so it can never collide with a
+   * {@link #requestKey} in the shared collection, and HMAC'd for the
+   * same reason request keys are: a Firestore reader without the salt
+   * can't correlate markers with tokens they've seen.
+   */
+  public @NotNull String consumptionKey(@NotNull String proposalId) {
+    return hmacHex("consumed|" + proposalId);
+  }
+
+  private @NotNull String hmacHex(@NotNull String canonical) {
     try {
       var mac = Mac.getInstance("HmacSHA256");
       mac.init(new SecretKeySpec(this.hmacKey, "HmacSHA256"));
@@ -220,6 +236,54 @@ public class SlackMessageRegistry {
         throw new RuntimeException(
           "Failed to read Slack message registry entry " + requestKey, e);
       }
+    }, this.executor);
+  }
+
+  /**
+   * Check whether a proposal was already used to approve (SECOP-1093).
+   * Missing document → not consumed.
+   */
+  public @NotNull CompletableFuture<Boolean> isProposalConsumed(
+    @NotNull String consumptionKey
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      try {
+        return collection().document(consumptionKey).get().get().exists();
+      }
+      catch (InterruptedException | ExecutionException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(
+          "Failed to read proposal consumption marker " + consumptionKey, e);
+      }
+    }, this.executor);
+  }
+
+  /**
+   * Record that a proposal was used to approve (SECOP-1093). The marker
+   * lives in the same collection as request entries so the existing
+   * Firestore TTL policy on {@value #FIELD_EXPIRES_AT} reaps it — the
+   * expiry passed here must be the token expiry, since a marker is only
+   * meaningful while the token it blocks is still valid.
+   */
+  public @NotNull CompletableFuture<Void> markProposalConsumed(
+    @NotNull String consumptionKey,
+    @NotNull Instant expiresAt
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      var doc = new HashMap<String, Object>();
+      doc.put(FIELD_EXPIRES_AT, Timestamp.ofTimeSecondsAndNanos(
+        expiresAt.getEpochSecond(),
+        expiresAt.getNano()));
+      doc.put(FIELD_CONSUMED, true);
+      try {
+        collection().document(consumptionKey).set(doc).get();
+      }
+      catch (InterruptedException | ExecutionException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(
+          "Failed to write proposal consumption marker " + consumptionKey, e);
+      }
+      return null;
     }, this.executor);
   }
 

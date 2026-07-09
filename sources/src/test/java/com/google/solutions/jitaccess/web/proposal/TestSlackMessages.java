@@ -163,6 +163,23 @@ public class TestSlackMessages {
   }
 
   // -------------------------------------------------------------------------
+  // reviewerApprovedByYou — replaces the approver's own DM (SECOP-1094).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void reviewerApprovedByYou_dropsActionButtonAndNamesRequester() {
+    var blocks = SlackMessages.reviewerApprovedByYou(
+      "alice@example.com", "env/sys/grp");
+
+    assertFalse(blocks.stream().anyMatch(ActionsBlock.class::isInstance),
+      "the approver's post-approval message must not carry the action link");
+    var serialized = blocks.toString();
+    assertTrue(serialized.contains("alice@example.com"));
+    assertTrue(serialized.contains("env/sys/grp"));
+    assertTrue(serialized.contains("You approved"));
+  }
+
+  // -------------------------------------------------------------------------
   // beneficiaryApproved — confirms to requester that the elevation landed.
   // -------------------------------------------------------------------------
 
@@ -188,6 +205,8 @@ public class TestSlackMessages {
       .contains("alice@example.com"));
     assertTrue(SlackMessages.reviewerSiblingUpdateFallback("bob@example.com")
       .contains("bob@example.com"));
+    assertTrue(SlackMessages.reviewerApprovedByYouFallback("alice@example.com")
+      .contains("alice@example.com"));
     assertTrue(SlackMessages.beneficiaryApprovedFallback("env/sys/grp", "bob@example.com")
       .contains("env/sys/grp"));
   }
