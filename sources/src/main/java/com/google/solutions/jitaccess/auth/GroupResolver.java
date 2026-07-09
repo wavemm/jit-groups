@@ -72,6 +72,14 @@ import java.util.concurrent.Executor;
  *   <li>{@link com.google.solutions.jitaccess.web.rest.GroupsResource#post}
  *       — selectedReviewers subset check: combines {@code expand} with
  *       a separate ACL lookup, NOT a sole authorisation source. ✓
+ *   <li>{@code GroupsResource#autoNarrowedReviewers} (also reached
+ *       from {@code post}) — empty-selection auto-narrow (SECOP-952):
+ *       its output becomes {@code ProposeOptions.reviewerFilter}, i.e.
+ *       the proposal recipient set. Degraded {@code expand} output can
+ *       only SHRINK that set (silently-dropped members yield fewer
+ *       teammates), never widen it beyond the qualified peers, so the
+ *       failure mode is fail-closed: fewer people notified/able to
+ *       approve, backstopped by the catalog-side subset defense. ✓
  *   <li>{@link com.google.solutions.jitaccess.web.rest.GroupsResource#getReviewers}
  *       — picker candidate listing: best-effort, output is for UX
  *       only. ✓

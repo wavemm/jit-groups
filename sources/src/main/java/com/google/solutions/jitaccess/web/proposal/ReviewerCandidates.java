@@ -163,7 +163,8 @@ public class ReviewerCandidates {
       .map(u -> new Candidate(
         u.email,
         u.email,  // displayName: same as email until we wire Directory.users.get
-        badgeSet.contains(u)))
+        badgeSet.contains(u),
+        teamScore.getOrDefault(u, 0) > 0))
       .toList();
   }
 
@@ -276,11 +277,18 @@ public class ReviewerCandidates {
    *                    Directory API for actual display names
    * @param suggested true if this candidate is in the top
    *                  {@link #SUGGESTED_BADGE_TOP_N} ranked teammates
-   *                  (rendered with the "team" badge in the UI)
+   *                  (rendered with the "team" badge in the UI). A
+   *                  presentation cap — do not derive dispatch
+   *                  decisions from it; use {@link #teammate()}.
+   * @param teammate true if this candidate shares at least one small
+   *                 group with the requester (team score &gt; 0),
+   *                 uncapped. This is the signal the empty-selection
+   *                 auto-narrow (SECOP-952) dispatches DMs on.
    */
   public record Candidate(
     @NotNull String email,
     @NotNull String displayName,
-    boolean suggested
+    boolean suggested,
+    boolean teammate
   ) {}
 }

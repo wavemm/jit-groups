@@ -24,11 +24,15 @@ package com.google.solutions.jitaccess.web.rest;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.util.concurrent.RateLimiter;
+import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.google.solutions.jitaccess.apis.Logger;
 import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
+import com.google.solutions.jitaccess.apis.clients.AccessException;
 import com.google.solutions.jitaccess.apis.clients.CloudIdentityGroupsClient;
 import com.google.solutions.jitaccess.auth.EndUserId;
+import com.google.solutions.jitaccess.auth.GroupId;
 import com.google.solutions.jitaccess.auth.GroupResolver;
+import com.google.solutions.jitaccess.auth.IamPrincipalId;
 import com.google.solutions.jitaccess.auth.JitGroupId;
 import com.google.solutions.jitaccess.auth.Principal;
 import com.google.solutions.jitaccess.auth.Subject;
@@ -53,6 +57,7 @@ import jakarta.ws.rs.core.UriInfo;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
@@ -172,34 +177,17 @@ public class GroupsResource {
         inputValues.remove(FIELD_NOTIFY_REVIEWERS));
 
       //
-      // Resolve the *effective* reviewer filter handed to
-      // JoinOperation.propose (ProposeOptions.reviewerFilter):
+      // When the requester picked specific reviewers, validate every
+      // email is in the expanded qualified-peer set BEFORE calling
+      // propose. JoinOperation.propose trusts the filter is already
+      // an authorised subset (it short-circuits the recipients list
+      // to whatever we pass), so the security check needs to happen
+      // here where we have a GroupResolver to expand groups.
       //
-      //  - Requester picked reviewers → validate every email is in the
-      //    expanded qualified-peer set BEFORE calling propose.
-      //    JoinOperation.propose trusts the filter is already an
-      //    authorised subset (it short-circuits the recipients list to
-      //    whatever we pass), so the security check has to happen here
-      //    where we have a GroupResolver to expand groups.
-      //
-      //  - Requester picked nobody → auto-narrow (SECOP-952). Rather
-      //    than letting propose fall back to the entire policy ACL —
-      //    which, when it names a broad group like
-      //    engineering@roles.wave.com, expands to hundreds of Slack DMs
-      //    — narrow to the requester's suggested teammates. We never
-      //    broadcast to a large group on an empty selection.
-      //
-      Set<EndUserId> effectiveReviewers;
       if (selectedReviewers != null && !selectedReviewers.isEmpty()) {
-        var qualified = group.policy().effectiveAccessControlList()
-          .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
-          .stream()
-          .filter(p -> !p.equals(this.subject.user()))
-          .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
-          .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
-          .collect(Collectors.toCollection(HashSet::new));
-        var resolver = new GroupResolver(this.groupsClient, this.executor);
-        var allowedEmails = new ReviewerCandidates(resolver, this.groupsClient, this.executor)
+        var qualified = approversFromPolicy(group);
+        qualified.remove(this.subject.user());
+        var allowedEmails = reviewerCandidates()
           .compute(this.subject.user(), qualified)
           .stream()
           .map(c -> c.email().toLowerCase())
@@ -213,10 +201,6 @@ public class GroupsResource {
             "Selected reviewers are not authorised to approve this request: "
               + String.join(", ", rejected));
         }
-        effectiveReviewers = selectedReviewers;
-      }
-      else {
-        effectiveReviewers = autoNarrowedReviewers(group, groupId);
       }
 
       //
@@ -226,6 +210,35 @@ public class GroupsResource {
       Inputs.copyValues(inputValues, joinOp.input());
 
       if (joinOp.requiresApproval()) {
+        //
+        // Resolve the reviewer filter handed to propose
+        // (ProposeOptions.reviewerFilter). Resolved here — after
+        // requiresApproval is known — so self-approve joins never pay
+        // reviewer resolution (or its failure modes) for a filter
+        // that would go unused.
+        //
+        //  - Reviewers picked → use them (validated above).
+        //  - notifyReviewers=false (copy-link) → nobody is DM'd at
+        //    all, so there is no broadcast to narrow; keep the
+        //    upstream full-ACL recipient semantics so the pasted
+        //    link works for any qualified approver.
+        //  - Nothing picked → auto-narrow (SECOP-952). Rather than
+        //    letting propose fall back to the entire policy ACL —
+        //    which, when it names a broad group like
+        //    engineering@roles.wave.com, expands to hundreds of
+        //    Slack DMs — narrow to the requester's teammates.
+        //
+        Set<EndUserId> effectiveReviewers;
+        if (selectedReviewers != null && !selectedReviewers.isEmpty()) {
+          effectiveReviewers = selectedReviewers;
+        }
+        else if (!notifyReviewers) {
+          effectiveReviewers = null;
+        }
+        else {
+          effectiveReviewers = autoNarrowedReviewers(group, groupId);
+        }
+
         //
         // Approval required, propose to someone else.
         //
@@ -300,10 +313,11 @@ public class GroupsResource {
 
   /**
    * Cap on the number of selected reviewers a single picker submission
-   * can carry. Sane upper bound — ACLs that grant APPROVE_OTHERS to
-   * groups larger than this number still pass through the legacy "DM
-   * everyone" path because the picker can't fit them all on screen
-   * anyway.
+   * can carry — a sane upper bound on client-supplied fan-out (the
+   * picker can't usefully render a selection this large anyway). What
+   * happens when NOTHING is selected is governed separately by
+   * {@link #autoNarrowedReviewers} and
+   * {@link #AUTO_NARROW_BROADCAST_LIMIT}.
    */
   static final int SELECTED_REVIEWERS_MAX = 50;
 
@@ -386,11 +400,18 @@ public class GroupsResource {
   }
 
   /**
-   * Largest expanded approver set we'll DM in full on an empty picker
-   * selection (SECOP-952). At or below this many individual reviewers,
-   * "notify everyone" is a small-team broadcast and stays the upstream
-   * default; above it — with no teammate to narrow to — we refuse to
-   * broadcast and require an explicit pick instead.
+   * Largest approver set (requester excluded) we'll DM in full on an
+   * empty picker selection (SECOP-952). At or below this many
+   * individual reviewers, "notify everyone" is a small-team broadcast
+   * and stays the upstream default; above it we narrow to teammates,
+   * and — with no teammate to narrow to — refuse to broadcast and
+   * require an explicit pick instead.
+   *
+   * <p>Also caps how many teammates the auto-narrowed filter itself
+   * carries. Deliberately distinct from {@link
+   * ReviewerCandidates#SUGGESTED_BADGE_TOP_N}, which is a UI
+   * presentation cap: tying the DM audience to the badge would let a
+   * cosmetic tweak silently change production notification fan-out.
    *
    * <p>Sized to a generous single team: Wave teams are typically &lt;15
    * (see {@link ReviewerCandidates#SUGGESTION_GROUP_MAX_SIZE}), so a set
@@ -400,75 +421,124 @@ public class GroupsResource {
   static final int AUTO_NARROW_BROADCAST_LIMIT = 15;
 
   /**
-   * Compute the reviewer filter for an empty picker selection
-   * (SECOP-952). The requester didn't pick anyone, so instead of
-   * letting {@link JitGroupContext.JoinOperation#propose} fall back to
-   * the entire policy ACL — which DMs every member of any group in it —
-   * we narrow to the requester's likely teammates.
+   * Compute the reviewer filter for an empty picker selection on a
+   * join that requires approval (SECOP-952). The requester didn't pick
+   * anyone, so instead of letting {@link
+   * JitGroupContext.JoinOperation#propose} fall back to the entire
+   * policy ACL — which DMs every member of any group in it — we narrow
+   * to the requester's teammates.
    *
    * <p>Returns:
    * <ul>
    *   <li>{@code null} — no narrowing; {@code propose} uses the full
-   *       policy ACL. Used when the approver set is small and contains
-   *       no group, i.e. a handful of named individuals where DMing
-   *       everyone isn't "loud". This path makes no Cloud Identity
-   *       calls.
-   *   <li>a non-empty subset — the requester's suggested teammates
-   *       ({@link ReviewerCandidates.Candidate#suggested()}), used when
+   *       policy ACL. Used when the approver set (requester excluded)
+   *       is small and contains no group, i.e. a handful of named
+   *       individuals where DMing everyone isn't "loud". This path
+   *       makes no Cloud Identity calls. Also the degraded outcome for
+   *       group-free ACLs when Cloud Identity is unavailable — the
+   *       named individuals are already enumerated in the policy, so
+   *       the bounded broadcast beats dead-ending the requester whose
+   *       picker is degraded too.
+   *   <li>a non-empty subset — the requester's teammates
+   *       ({@link ReviewerCandidates.Candidate#teammate()}, i.e.
+   *       sharing at least one small group), highest-affinity first,
+   *       capped at {@link #AUTO_NARROW_BROADCAST_LIMIT}. Used when
    *       the ACL contains a group (or many direct approvers) so we
    *       avoid broadcasting to the whole group.
    * </ul>
    *
-   * <p>Throws {@link BadRequestException} when the approver set is large
-   * AND no teammate can be auto-selected: we won't silently DM everyone,
-   * so we ask the requester to pick at least one reviewer. That is the
-   * only case an empty selection is rejected — it preserves the
-   * "never broadcast to a large group" guarantee without forcing a pick
-   * in the common small-team / clear-teammate cases. The same
-   * fail-safe applies if teammate resolution errors out (Cloud Identity
-   * outage / permission gap): we'd rather ask for a pick than broadcast.
+   * <p>Throws {@link BadRequestException} when we won't pick for the
+   * requester and won't broadcast either: a large approver set with no
+   * teammate signal, or a group-bearing ACL whose expansion failed
+   * (a group's membership is unknowable without Cloud Identity, so
+   * there is no bounded fallback). Throws a 429
+   * {@link WebApplicationException} when the per-user rate limit is
+   * exhausted — this path performs the same Cloud Identity fan-out
+   * that {@link #getReviewers} throttles, and must not become an
+   * unthrottled back door to it.
    */
   private @Nullable Set<EndUserId> autoNarrowedReviewers(
     @NotNull JitGroupContext group,
     @NotNull JitGroupId groupId
   ) {
-    var rawApprovers = group.policy().effectiveAccessControlList()
-      .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
-      .stream()
-      .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
-      .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
-      .collect(Collectors.toSet());
+    var approvers = approversFromPolicy(group);
+    if (approvers.isEmpty()) {
+      //
+      // Nobody holds APPROVE_OTHERS; pass through and let propose()
+      // surface its canonical "no principals could approve" error.
+      //
+      return null;
+    }
 
-    var hasGroupApprover = rawApprovers.stream()
-      .anyMatch(com.google.solutions.jitaccess.auth.GroupId.class::isInstance);
+    var requester = this.subject.user();
+    // Exclude the requester BEFORE the size guard: propose() and the
+    // Slack fan-out both drop them, so they must not count toward the
+    // broadcast size either.
+    approvers.remove(requester);
+
+    var hasGroupApprover = approvers.stream()
+      .anyMatch(GroupId.class::isInstance);
 
     //
     // Cheap guard: no group in the ACL and only a few named approvers →
     // DMing all of them is not a broad broadcast. Keep the upstream
     // DM-everyone behaviour and skip the Cloud Identity round-trips
-    // entirely (this also keeps no-approval / no-approver flows from
-    // touching the groups client at all).
+    // entirely (this also keeps no-approver flows from touching the
+    // groups client at all).
     //
-    if (rawApprovers.isEmpty()
-      || (!hasGroupApprover && rawApprovers.size() <= AUTO_NARROW_BROADCAST_LIMIT)) {
+    if (approvers.isEmpty()
+      || (!hasGroupApprover && approvers.size() <= AUTO_NARROW_BROADCAST_LIMIT)) {
       return null;
     }
 
-    var requester = this.subject.user();
-    var qualified = rawApprovers.stream()
-      .filter(p -> !p.equals(requester))
-      .collect(Collectors.toCollection(HashSet::new));
+    //
+    // Same per-user rate limit as getReviewers — compute() below is
+    // the identical listMembershipsByUser + parallel listMemberships
+    // fan-out, and without a limiter this POST path would be an
+    // unthrottled back door to the Cloud Identity quota. The blocking
+    // acquire (1 s = exactly one permit interval at
+    // REVIEWERS_RATE_PER_SECOND) means the normal picker-GET-then-
+    // submit sequence never trips it, while sustained polling gets
+    // 429s and holds a request thread for at most a second.
+    //
+    if (!rateLimiterFor(requester.email)
+      .tryAcquire(1, java.util.concurrent.TimeUnit.SECONDS)) {
+      this.logger.warn(
+        EventIds.API_JOIN_GROUP,
+        "Auto-narrow rate limit exceeded by %s on %s",
+        requester.email, groupId);
+      throw new WebApplicationException(
+        "Too many requests; please retry shortly.", 429);
+    }
 
     List<ReviewerCandidates.Candidate> candidates;
     try {
-      var resolver = new GroupResolver(this.groupsClient, this.executor);
-      candidates = new ReviewerCandidates(resolver, this.groupsClient, this.executor)
-        .compute(requester, qualified);
+      candidates = reviewerCandidates().compute(requester, approvers);
     }
-    catch (com.google.solutions.jitaccess.apis.clients.AccessException
-      | java.io.IOException e) {
-      // Fail safe = never broadcast. If teammates can't be computed,
-      // don't silently DM the whole group — require an explicit pick.
+    catch (AccessException | IOException | UncheckedExecutionException e) {
+      // NB. GroupResolver.expand wraps I/O failures from group
+      //     expansion in UncheckedExecutionException — it must be
+      //     caught here too, or expansion failures bypass this
+      //     fail-safe and surface as a 500.
+      if (!hasGroupApprover) {
+        //
+        // Group-free ACL: the approver set is exactly the named
+        // individuals above, and DMing them requires no Cloud
+        // Identity at all. Degrade to that bounded, pre-SECOP-952
+        // broadcast rather than dead-ending the requester — during a
+        // Cloud Identity outage the picker is degraded too, so
+        // "please pick someone" would be circular guidance.
+        //
+        this.logger.warn(
+          EventIds.API_JOIN_GROUP,
+          "Auto-narrow of reviewers failed for %s on %s; falling back "
+            + "to notifying all %d policy-named approvers. cause=%s",
+          requester.email, groupId, approvers.size(), e);
+        return null;
+      }
+      // Group-bearing ACL: membership is unknowable without Cloud
+      // Identity, so there is no bounded fallback. Fail safe = never
+      // broadcast; require an explicit pick.
       this.logger.warn(
         EventIds.API_JOIN_GROUP,
         "Auto-narrow of reviewers failed for %s on %s; requiring an "
@@ -479,13 +549,22 @@ public class GroupsResource {
           + "select at least one reviewer for this request.");
     }
 
-    var suggested = candidates.stream()
-      .filter(ReviewerCandidates.Candidate::suggested)
+    //
+    // Teammates = every candidate sharing at least one small group
+    // with the requester, in affinity order (compute() ranks them
+    // score-first). NOT the `suggested` badge: that is capped at
+    // ReviewerCandidates.SUGGESTED_BADGE_TOP_N for presentation, and
+    // an audience of 3 is fragile — a couple of OOO or offboarded
+    // teammates would strand the request.
+    //
+    var teammates = candidates.stream()
+      .filter(ReviewerCandidates.Candidate::teammate)
+      .limit(AUTO_NARROW_BROADCAST_LIMIT)
       .map(c -> new EndUserId(c.email()))
       .collect(Collectors.toSet());
 
-    if (!suggested.isEmpty()) {
-      return suggested;
+    if (!teammates.isEmpty()) {
+      return teammates;
     }
 
     //
@@ -499,6 +578,28 @@ public class GroupsResource {
       "This role's approver list expands to " + candidates.size()
         + " people and none share a team with you. Please pick at least "
         + "one reviewer so we don't notify everyone.");
+  }
+
+  /**
+   * Principals holding APPROVE_OTHERS in the group's effective ACL —
+   * the raw qualified-approver set (requester NOT excluded). Shared by
+   * the picked-reviewer validation, the empty-selection auto-narrow,
+   * and the picker listing so the three stay in lockstep.
+   */
+  private @NotNull Set<IamPrincipalId> approversFromPolicy(
+    @NotNull JitGroupContext group
+  ) {
+    return group.policy().effectiveAccessControlList()
+      .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
+      .stream()
+      .filter(p -> p instanceof IamPrincipalId)
+      .map(p -> (IamPrincipalId) p)
+      .collect(Collectors.toCollection(HashSet::new));
+  }
+
+  private @NotNull ReviewerCandidates reviewerCandidates() {
+    var resolver = new GroupResolver(this.groupsClient, this.executor);
+    return new ReviewerCandidates(resolver, this.groupsClient, this.executor);
   }
 
   /**
@@ -586,23 +687,14 @@ public class GroupsResource {
         throw new WebApplicationException(
           "Too many requests; please retry shortly.", 429);
       }
-      var qualified = group.policy().effectiveAccessControlList()
-        .allowedPrincipals(PolicyPermission.APPROVE_OTHERS.toMask())
-        .stream()
-        .filter(p -> !p.equals(requester))
-        .filter(p -> p instanceof com.google.solutions.jitaccess.auth.IamPrincipalId)
-        .map(p -> (com.google.solutions.jitaccess.auth.IamPrincipalId) p)
-        .collect(Collectors.toCollection(HashSet::new));
-
-      var resolver = new GroupResolver(this.groupsClient, this.executor);
-      var helper = new ReviewerCandidates(resolver, this.groupsClient, this.executor);
+      var qualified = approversFromPolicy(group);
+      qualified.remove(requester);
 
       List<ReviewerCandidates.Candidate> candidates;
       try {
-        candidates = helper.compute(requester, qualified);
+        candidates = reviewerCandidates().compute(requester, qualified);
       }
-      catch (com.google.solutions.jitaccess.apis.clients.AccessException
-        | java.io.IOException e) {
+      catch (AccessException | IOException e) {
         // Picker is best-effort: a Cloud Identity outage or a missing
         // group-membership permission must not block the elevation
         // request. Return the degraded shape and let the frontend
