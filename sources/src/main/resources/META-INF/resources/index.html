@@ -962,8 +962,21 @@
                     });
                 }
                 else if (groupInfo.join.status == 'JOIN_PROPOSED') {
+                    // SECOP-1099: name the notified reviewers, and when the
+                    // set was auto-picked, teach the picker.
+                    let secondary = undefined;
+                    if (groupInfo.join.notifiedReviewers &&
+                        groupInfo.join.notifiedReviewers.length > 0) {
+                        secondary = groupInfo.join.reviewersAutoSelected
+                            ? "Sent to what we think are your closest teammates " +
+                              "(since you didn't pick anyone specifically): " +
+                              groupInfo.join.notifiedReviewers.join(", ") +
+                              " — next time you can choose reviewers with the picker above."
+                            : "Sent to: " + groupInfo.join.notifiedReviewers.join(", ");
+                    }
                     this.membership.addRow({
                         primary: "Your request to join the group was sent for approval",
+                        secondary: secondary,
                         icon: 'outgoing_mail'
                     });
                 }

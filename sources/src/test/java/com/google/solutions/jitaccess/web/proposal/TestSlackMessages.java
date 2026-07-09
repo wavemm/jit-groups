@@ -180,6 +180,26 @@ public class TestSlackMessages {
   }
 
   // -------------------------------------------------------------------------
+  // beneficiaryProposed — tells the requester who was auto-notified
+  // (SECOP-1099).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void beneficiaryProposed_namesReviewersAndTeachesPicker() {
+    var blocks = SlackMessages.beneficiaryProposed(
+      "env/sys/grp",
+      java.util.List.of("bob@example.com", "carol@example.com"));
+
+    var serialized = blocks.toString();
+    assertTrue(serialized.contains("bob@example.com"));
+    assertTrue(serialized.contains("carol@example.com"));
+    assertTrue(serialized.contains("closest teammates"));
+    assertTrue(serialized.contains("Select reviewers"),
+      "the DM must teach the picker");
+    assertFalse(blocks.stream().anyMatch(ActionsBlock.class::isInstance));
+  }
+
+  // -------------------------------------------------------------------------
   // beneficiaryApproved — confirms to requester that the elevation landed.
   // -------------------------------------------------------------------------
 

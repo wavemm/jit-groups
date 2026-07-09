@@ -163,6 +163,19 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull ProposalHandler.ProposalToken token,
     @NotNull URI actionUri
   ) throws AccessException, IOException {
+    onOperationProposed(
+      operation, proposal, token, actionUri,
+      ProposalHandler.ProposeOptions.DEFAULT);
+  }
+
+  @Override
+  void onOperationProposed(
+    @NotNull JitGroupContext.JoinOperation operation,
+    @NotNull Proposal proposal,
+    @NotNull ProposalHandler.ProposalToken token,
+    @NotNull URI actionUri,
+    @NotNull ProposalHandler.ProposeOptions options
+  ) throws AccessException, IOException {
     RegistryFingerprint fp;
     try {
       fp = fingerprint(proposal);
@@ -353,11 +366,42 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         fp.key(), fp.beneficiary(), fp.groupId(), e);
     }
 
+    //
+    // SECOP-1099: when the reviewer set was picked on the requester's
+    // behalf (empty picker selection), tell them who we notified —
+    // people watch Slack, not the PAM UI, and the message doubles as
+    // the picker explainer. Best-effort: a failure here must not fail
+    // the propose that already landed reviewer DMs.
+    //
+    if (options.reviewersAutoSelected() && !posted.isEmpty()) {
+      var notifiedEmails = posted.stream()
+        .map(ReviewerMessage::email)
+        .sorted()
+        .toList();
+      try {
+        var beneficiaryUserId =
+          this.slackClient.lookupUserByEmail(fp.beneficiary()).join();
+        if (beneficiaryUserId != null) {
+          this.slackClient.postDirectMessage(
+            beneficiaryUserId,
+            SlackMessages.beneficiaryProposed(fp.groupId(), notifiedEmails),
+            SlackMessages.beneficiaryProposedFallback(fp.groupId())).join();
+        }
+      }
+      catch (RuntimeException e) {
+        var cause = e.getCause() != null ? e.getCause() : e;
+        this.logger.warn(
+          "slack.beneficiaryProposedDM.failed",
+          "Failed to DM requester %s the auto-selected reviewer list for %s: %s",
+          fp.beneficiary(), fp.groupId(), cause.getMessage());
+      }
+    }
+
     this.logger.info(
       "slack.onOperationProposed",
-      "Posted %d/%d Slack DMs for %s requesting %s (key=%s, failures=%s)",
+      "Posted %d/%d Slack DMs for %s requesting %s (key=%s, autoSelected=%s, failures=%s)",
       posted.size(), fp.reviewerEmails().size(), fp.beneficiary(), fp.groupId(),
-      fp.key(), failures);
+      fp.key(), options.reviewersAutoSelected(), failures);
   }
 
   @Override
