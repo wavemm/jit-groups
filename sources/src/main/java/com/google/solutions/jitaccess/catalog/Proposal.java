@@ -88,6 +88,18 @@ public interface Proposal {
   }
 
   /**
+   * Wavemm fork (SECOP-1093): stable, unpredictable identifier of this
+   * proposal — for token-backed proposals, the JWT {@code jti} claim.
+   * Used to record consumption so an approval link can be used exactly
+   * once. {@code null} when the proposal implementation has no such
+   * identifier; consumers must treat that as "consumption tracking not
+   * available" and skip enforcement rather than fail.
+   */
+  default String id() {
+    return null;
+  }
+
+  /**
    * Invoked when the proposal was completed successfully.
    */
   void onCompleted(

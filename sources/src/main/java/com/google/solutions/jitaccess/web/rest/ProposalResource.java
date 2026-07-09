@@ -85,6 +85,11 @@ public class ProposalResource {
         proposal.group().environment().equals(environment),
         "The token must match the environment");
 
+      // SECOP-1093: an already-used approval link renders the same
+      // "URL no longer valid" banner as an expired one, instead of an
+      // approval page whose submit would then fail.
+      this.proposalHandler.verifyNotConsumed(proposal);
+
       return this.catalog
         .group(proposal.group())
         .map(grp -> ProposalInfo.create(
@@ -126,6 +131,11 @@ public class ProposalResource {
         groupId.environment().equals(environment),
         "The token must match the environment");
 
+      // SECOP-1093: proposal tokens approve exactly once. The check
+      // runs BEFORE the approval executes; the marker is written right
+      // after it succeeds.
+      this.proposalHandler.verifyNotConsumed(proposal);
+
       //
       // Attempt to approve.
       //
@@ -138,6 +148,7 @@ public class ProposalResource {
 
       var principal = approveOp.execute();
       this.auditTrail.joinExecuted(approveOp, principal);
+      this.proposalHandler.markConsumed(proposal);
 
       return ProposalInfo.create(
         group,

@@ -70,6 +70,27 @@ public class TestSlackMessageRegistry {
         + "may iterate the recipients Set in different orders.");
   }
 
+  // -------------------------------------------------------------------------
+  // consumptionKey (SECOP-1093) — deterministic, salted, and namespaced
+  // away from request keys since both live in the same collection.
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void consumptionKey_isDeterministicAndSaltDependent() {
+    var registry = newRegistry(SALT_A);
+    assertEquals(
+      registry.consumptionKey("jti-1"),
+      registry.consumptionKey("jti-1"));
+    assertNotEquals(
+      registry.consumptionKey("jti-1"),
+      registry.consumptionKey("jti-2"));
+    assertNotEquals(
+      registry.consumptionKey("jti-1"),
+      newRegistry(SALT_B).consumptionKey("jti-1"),
+      "an attacker without the salt must not be able to precompute keys");
+    assertEquals(64, registry.consumptionKey("jti-1").length(), "HMAC-SHA-256 hex");
+  }
+
   @Test
   public void requestKey_distinguishesBeneficiary() {
     var registry = newRegistry(SALT_A);

@@ -11,6 +11,7 @@
 package com.google.solutions.jitaccess.web.proposal;
 
 import com.google.solutions.jitaccess.apis.Logger;
+import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
 import com.google.solutions.jitaccess.auth.EndUserId;
 import com.google.solutions.jitaccess.auth.GroupResolver;
 import com.google.solutions.jitaccess.auth.IamPrincipalId;
@@ -377,6 +378,109 @@ public class TestSlackProposalHandler {
   // ---------------------------------------------------------------------
   // Options — fan-out concurrency cap (wavemm fork P1-4)
   // ---------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // verifyNotConsumed / markConsumed (SECOP-1093).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void verifyNotConsumed_rejectsConsumedProposal() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(eq("consumption-key")))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    assertThrows(
+      AccessDeniedException.class,
+      () -> handler.verifyNotConsumed(proposal));
+  }
+
+  @Test
+  public void verifyNotConsumed_allowsFreshProposal() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(eq("consumption-key")))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.verifyNotConsumed(proposal);  // must not throw
+  }
+
+  @Test
+  public void verifyNotConsumed_skipsProposalsWithoutId() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    // proposalFor leaves Proposal#id unstubbed → null (no jti).
+    handler.verifyNotConsumed(proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)));
+
+    verify(registry, never()).isProposalConsumed(anyString());
+  }
+
+  /**
+   * SECOP-1093: consumption is anti-replay defense-in-depth, not the
+   * authorization itself — a Firestore outage must not block approvals.
+   */
+  @Test
+  public void verifyNotConsumed_failsOpenOnRegistryError() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.isProposalConsumed(anyString()))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore unavailable")));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.verifyNotConsumed(proposal);  // must not throw
+  }
+
+  @Test
+  public void markConsumed_writesMarkerWithTokenExpiry() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.markProposalConsumed(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var expiry = Instant.now().plus(Duration.ofHours(1));
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+    when(proposal.expiry()).thenReturn(expiry);
+
+    handler.markConsumed(proposal);
+
+    verify(registry).markProposalConsumed(eq("consumption-key"), eq(expiry));
+  }
+
+  @Test
+  public void markConsumed_swallowsRegistryErrors() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.markProposalConsumed(anyString(), any()))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore unavailable")));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+
+    handler.markConsumed(proposal);  // must not throw
+  }
 
   @Test
   public void options_singleArgConstructor_appliesDefaultFanOutCap() {

@@ -12,6 +12,7 @@ package com.google.solutions.jitaccess.web.proposal;
 
 import com.google.common.base.Preconditions;
 import com.google.solutions.jitaccess.apis.Logger;
+import com.google.solutions.jitaccess.apis.clients.AccessDeniedException;
 import com.google.solutions.jitaccess.apis.clients.AccessException;
 import com.google.solutions.jitaccess.auth.EndUserId;
 import com.google.solutions.jitaccess.auth.GroupResolver;
@@ -442,6 +443,74 @@ public class SlackProposalHandler extends AbstractProposalHandler {
       "slack.onProposalApproved",
       "Updated %d reviewer DM(s) for approved request key=%s (approver=%s)",
       entriesOpt.get().size(), fp.key(), approverEmail);
+  }
+
+  /**
+   * SECOP-1093: reject approval links that were already used. Fail-open
+   * on Firestore errors — the JWT signature remains the authoritative
+   * authorization; consumption is anti-replay defense-in-depth, and an
+   * approval must not hard-depend on Firestore availability. Failures
+   * are logged at ERROR so an outage window (during which tokens
+   * temporarily regain the upstream replayable semantics) is visible.
+   */
+  @Override
+  public void verifyNotConsumed(@NotNull Proposal proposal)
+    throws AccessException {
+    var proposalId = proposal.id();
+    if (proposalId == null) {
+      // Proposal implementation without a stable id — nothing to check.
+      return;
+    }
+    boolean consumed;
+    try {
+      consumed = this.registry
+        .isProposalConsumed(this.registry.consumptionKey(proposalId))
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.error(
+        "slack.consumption.checkFailed",
+        "Failed to check proposal consumption for id=%s; allowing the "
+          + "approval (fail-open) — replay protection is degraded until "
+          + "Firestore recovers. cause=%s",
+        proposalId, cause.getMessage());
+      return;
+    }
+    if (consumed) {
+      throw new AccessDeniedException(
+        "This approval link has already been used. If further access is "
+          + "needed, ask the requester to submit a new request.");
+    }
+  }
+
+  /**
+   * SECOP-1093: record consumption after a successful approval.
+   * Best-effort by contract — the approval already succeeded, so a
+   * failed write only restores replayability for this one token; log
+   * loud and move on.
+   */
+  @Override
+  public void markConsumed(@NotNull Proposal proposal) {
+    var proposalId = proposal.id();
+    if (proposalId == null) {
+      return;
+    }
+    try {
+      this.registry
+        .markProposalConsumed(
+          this.registry.consumptionKey(proposalId),
+          proposal.expiry())
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.error(
+        "slack.consumption.markFailed",
+        "Failed to record proposal consumption for id=%s; this token "
+          + "remains replayable until it expires at %s. cause=%s",
+        proposalId, proposal.expiry(), cause.getMessage());
+    }
   }
 
   private void notifyBeneficiary(
