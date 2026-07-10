@@ -162,7 +162,19 @@ public class SlackClient {
       try {
         UsersGetPresenceResponse response =
           this.methods.usersGetPresence(req -> req.user(slackUserId));
-        return response.isOk() && "active".equals(response.getPresence());
+        if (!response.isOk()) {
+          // SECOP-1104: surface it. A persistent error (e.g.
+          // missing_scope for users:read — a scope this feature newly
+          // requires) would otherwise silently degrade every candidate
+          // to "not active", making the availability ranking an inert
+          // no-op with no signal.
+          this.logger.warn(
+            "slack.getPresence.failed",
+            "users.getPresence for %s failed: %s (treating as not active)",
+            slackUserId, response.getError());
+          return false;
+        }
+        return "active".equals(response.getPresence());
       }
       catch (SlackApiException e) {
         throw new IOException("Slack API error in users.getPresence for " + slackUserId, e);
@@ -182,7 +194,14 @@ public class SlackClient {
       try {
         UsersInfoResponse response =
           this.methods.usersInfo(req -> req.user(slackUserId));
-        if (!response.isOk() || response.getUser() == null) {
+        if (!response.isOk()) {
+          this.logger.warn(
+            "slack.usersInfo.failed",
+            "users.info for %s failed: %s (timezone unknown)",
+            slackUserId, response.getError());
+          return null;
+        }
+        if (response.getUser() == null) {
           return null;
         }
         return response.getUser().getTzOffset();

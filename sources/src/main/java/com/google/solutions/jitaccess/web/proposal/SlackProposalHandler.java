@@ -721,25 +721,31 @@ public class SlackProposalHandler extends AbstractProposalHandler {
       .toList();
 
     try {
-      var requesterTz = timezoneOffsetOrNull(requester.email);
-
       //
-      // Enrich each shortlisted teammate: (active?, tzOffset). Bounded
-      // to the shortlist and gated by the picker's per-user rate limiter
-      // upstream, so a handful of extra Slack calls per empty-selection
-      // propose. Sequential is fine at this size.
+      // SECOP-1104: enrich the shortlist CONCURRENTLY. Each candidate's
+      // (lookup → presence+tz) is an async chain; we fire them all and
+      // join once, so the cost is ~one round-trip pair rather than the
+      // ~3×15 strictly-sequential calls the first cut made on this
+      // already-slow POST path. The requester's tz is fetched in
+      // parallel too. Every chain degrades to "unknown" (tier 2) on its
+      // own error — a single bad candidate must not abort the ranking.
       //
-      var byEmail = new HashMap<String, Availability>();
+      var requesterTzFuture = timezoneOffsetFuture(requester.email);
+      var futures = new HashMap<String, CompletableFuture<Availability>>();
       for (var u : shortlist) {
-        byEmail.put(u.email, availabilityOf(u.email));
+        futures.put(u.email, availabilityFuture(u.email));
+      }
+      var requesterTz = requesterTzFuture.join();
+      var byEmail = new HashMap<String, Availability>();
+      for (var e : futures.entrySet()) {
+        byEmail.put(e.getKey(), e.getValue().join());
       }
 
       //
       // Stable sort: keep affinity order (the shortlist's existing
-      // order) except promote (1) currently-active teammates, then
-      // (2) those in a working-hours timezone near the requester's.
-      // Comparator returns 0 for same tier so Java's stable sort
-      // preserves affinity within a tier.
+      // order) except promote (0) currently-active teammates, then
+      // (1) those in a working-hours timezone near the requester's.
+      // Java's sort is stable, so affinity breaks ties within a tier.
       //
       var ranked = new ArrayList<>(shortlist);
       ranked.sort(java.util.Comparator.comparingInt(
@@ -747,10 +753,23 @@ public class SlackProposalHandler extends AbstractProposalHandler {
 
       var result = new ArrayList<>(ranked);
       result.addAll(tail);
+
+      //
+      // Log the tier distribution, not just "reordered N" — if the bot
+      // token lacks users:read every candidate silently lands in tier 2
+      // (ranking is a no-op) and this line makes that visible
+      // (active=0 tzNear=0) rather than falsely implying it worked.
+      //
+      var active = shortlist.stream()
+        .filter(u -> availabilityTier(byEmail.get(u.email), requesterTz) == 0).count();
+      var tzNear = shortlist.stream()
+        .filter(u -> availabilityTier(byEmail.get(u.email), requesterTz) == 1).count();
       this.logger.info(
         "slack.rankReviewersByAvailability",
-        "Reordered %d candidate reviewer(s) availability-first for %s",
-        shortlist.size(), requester.email);
+        "Reordered %d reviewer(s) availability-first for %s "
+          + "(active=%d tzNear=%d other=%d)",
+        shortlist.size(), requester.email,
+        active, tzNear, shortlist.size() - active - tzNear);
       return result;
     }
     catch (RuntimeException e) {
@@ -775,26 +794,57 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     if (a.active()) {
       return 0;
     }
-    if (a.tzOffsetSeconds() != null && requesterTz != null
-      && Math.abs(a.tzOffsetSeconds() - requesterTz) <= TZ_PROXIMITY_SECONDS) {
-      return 1;
+    if (a.tzOffsetSeconds() != null && requesterTz != null) {
+      //
+      // SECOP-1104: compare offsets on a 24h circle. Raw |a-b| treats
+      // antimeridian neighbours (UTC+13 vs UTC-11 — identical local
+      // clocks) as ~24h apart; wrap so the smaller arc counts.
+      //
+      var diff = Math.abs(a.tzOffsetSeconds() - requesterTz);
+      var wrapped = Math.min(diff, 86400 - diff);
+      if (wrapped <= TZ_PROXIMITY_SECONDS) {
+        return 1;
+      }
     }
     return 2;
   }
 
-  private @NotNull Availability availabilityOf(@NotNull String email) {
-    var userId = this.slackClient.lookupUserByEmail(email).join();
-    if (userId == null) {
-      return new Availability(email, false, null);
-    }
-    var active = this.slackClient.isActive(userId).join();
-    var tz = this.slackClient.timezoneOffsetSeconds(userId).join();
-    return new Availability(email, active, tz);
+  /**
+   * Async (active?, tzOffset) for one candidate. Self-contained
+   * degradation: any failure in the chain yields "unknown" (tier 2)
+   * rather than failing the whole ranking (SECOP-1104).
+   */
+  private @NotNull CompletableFuture<Availability> availabilityFuture(
+    @NotNull String email
+  ) {
+    return this.slackClient.lookupUserByEmail(email)
+      .thenCompose(userId -> {
+        if (userId == null) {
+          return CompletableFuture.completedFuture(new Availability(email, false, null));
+        }
+        return this.slackClient.isActive(userId)
+          .thenCombine(
+            this.slackClient.timezoneOffsetSeconds(userId),
+            (active, tz) -> new Availability(email, active, tz));
+      })
+      .exceptionally(ex -> {
+        var cause = ex.getCause() != null ? ex.getCause() : ex;
+        this.logger.warn(
+          "slack.availabilityLookup.failed",
+          "Availability lookup failed for %s; treating as unknown. cause=%s",
+          email, cause.getMessage());
+        return new Availability(email, false, null);
+      });
   }
 
-  private @Nullable Integer timezoneOffsetOrNull(@NotNull String email) {
-    var userId = this.slackClient.lookupUserByEmail(email).join();
-    return userId == null ? null : this.slackClient.timezoneOffsetSeconds(userId).join();
+  private @NotNull CompletableFuture<@Nullable Integer> timezoneOffsetFuture(
+    @NotNull String email
+  ) {
+    return this.slackClient.lookupUserByEmail(email)
+      .thenCompose(userId -> userId == null
+        ? CompletableFuture.completedFuture((Integer) null)
+        : this.slackClient.timezoneOffsetSeconds(userId))
+      .exceptionally(ex -> null);
   }
 
   private record Availability(
