@@ -509,11 +509,11 @@ public class TestProposalResource {
   //---------------------------------------------------------------------------
 
   /**
-   * SECOP-1093: an already-consumed token must be rejected BEFORE the
-   * approval executes — no membership, no audit event, no re-mark.
+   * SECOP-1100: a token whose claim is already held must be rejected
+   * BEFORE the approval executes — no membership, no audit event.
    */
   @Test
-  public void post_whenProposalAlreadyConsumed_rejectsBeforeApproving()
+  public void post_whenProposalAlreadyClaimed_rejectsBeforeApproving()
     throws Exception {
     var group = Policies.createJitGroupPolicy(
       "g-1",
@@ -531,7 +531,7 @@ public class TestProposalResource {
       new EndUserId("other@example.com"),
       Set.of(SAMPLE_USER));
     doThrow(new AccessDeniedException("This approval link has already been used"))
-      .when(resource.proposalHandler).verifyNotConsumed(any(Proposal.class));
+      .when(resource.proposalHandler).claimForApproval(any(Proposal.class));
 
     assertThrows(
       AccessDeniedException.class,
@@ -543,15 +543,14 @@ public class TestProposalResource {
     verify(resource.auditTrail, never()).joinExecuted(
       any(JitGroupContext.ApprovalOperation.class),
       any(Principal.class));
-    verify(resource.proposalHandler, never()).markConsumed(any(Proposal.class));
   }
 
   /**
-   * SECOP-1093: the happy path checks consumption before approving and
-   * records consumption only after the approval succeeded.
+   * SECOP-1100: the happy path CLAIMS before executing (the atomic
+   * gate), then executes and audits. The claim precedes joinExecuted.
    */
   @Test
-  public void post_whenApprovalSucceeds_marksProposalConsumed()
+  public void post_whenApprovalSucceeds_claimsBeforeExecuting()
     throws Exception {
     var group = Policies.createJitGroupPolicy(
       "g-1",
@@ -575,12 +574,14 @@ public class TestProposalResource {
       new MultivaluedHashMap<>());
 
     var order = inOrder(resource.proposalHandler, resource.auditTrail);
-    order.verify(resource.proposalHandler).verifyNotConsumed(any(Proposal.class));
+    order.verify(resource.proposalHandler).claimForApproval(any(Proposal.class));
     order.verify(resource.auditTrail).joinExecuted(
       any(JitGroupContext.ApprovalOperation.class),
       any(Principal.class));
-    order.verify(resource.proposalHandler).markConsumed(any(Proposal.class));
+    // Success path never releases the claim.
+    verify(resource.proposalHandler, never()).releaseClaim(any(Proposal.class));
   }
+
 
   /**
    * SECOP-1093: viewing an already-used link fails like an expired one,

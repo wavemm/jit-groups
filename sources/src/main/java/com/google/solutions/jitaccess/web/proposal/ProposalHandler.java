@@ -107,14 +107,14 @@ public interface ProposalHandler {
   ) throws AccessException;
 
   /**
-   * Wavemm fork (SECOP-1093): reject proposals whose token was already
-   * used to approve. Proposal tokens are stateless JWTs — without a
-   * consumption record, one approval link authorizes unlimited re-grants
-   * for the token lifetime (~1h), each resetting the membership clock.
+   * Wavemm fork (SECOP-1093): read-only check that a proposal token
+   * hasn't been used to approve — used by the GET proposal-view path to
+   * render "this link has already been used" instead of an approval
+   * page whose submit would then fail. NOT the enforcement gate; that is
+   * {@link #claimForApproval} (a read here would be a TOCTOU).
    *
-   * <p>The default is a no-op: handlers without a consumption store
-   * (mail, debug) keep the upstream replayable semantics. The Slack
-   * handler enforces via its Firestore registry.
+   * <p>Default no-op: handlers without a consumption store (mail, debug)
+   * keep upstream replayable semantics.
    *
    * @throws AccessException when the proposal was already consumed
    */
@@ -123,13 +123,34 @@ public interface ProposalHandler {
   }
 
   /**
-   * Wavemm fork (SECOP-1093): record that this proposal was used to
-   * approve, so subsequent {@link #verifyNotConsumed} calls reject it.
-   * Best-effort by contract — implementations must not fail the
-   * approval that just succeeded; a missed mark merely restores the
-   * upstream replayable behaviour for this one token.
+   * Wavemm fork (SECOP-1100): atomically claim a proposal token for
+   * approval, so exactly one approval executes even under concurrent
+   * clicks on the same link. Called immediately BEFORE the approval
+   * executes; on {@code ALREADY_EXISTS} it throws, so the second
+   * concurrent (or any later) approver is rejected rather than
+   * re-granting. Replaces the previous post-execute {@code markConsumed}
+   * upsert, whose check-then-act window let concurrent approvers all
+   * pass.
+   *
+   * <p>Default no-op (mail/debug stay replayable). The Slack handler
+   * fails open on infrastructure errors — availability over
+   * replay-protection, matching SECOP-1093 — but treats an explicit
+   * already-claimed result as a hard reject.
+   *
+   * @throws AccessException when the token is already claimed/consumed
    */
-  default void markConsumed(@NotNull Proposal proposal) {
+  default void claimForApproval(@NotNull Proposal proposal)
+    throws AccessException {
+  }
+
+  /**
+   * Wavemm fork (SECOP-1100): release a claim taken by
+   * {@link #claimForApproval} when the approval did not complete (e.g.
+   * the execute failed before granting), so a legitimate retry can
+   * approve. Best-effort; a failed release leaves the token burned,
+   * which is the fail-safe direction.
+   */
+  default void releaseClaim(@NotNull Proposal proposal) {
   }
 
   /**

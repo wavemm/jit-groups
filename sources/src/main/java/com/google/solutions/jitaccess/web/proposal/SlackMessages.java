@@ -189,8 +189,8 @@ final class SlackMessages {
         .build(),
       ContextBlock.builder()
         .elements(List.of(markdown(
-          ":information_source: Nothing more to do — the requester has "
-            + "been notified.")))
+          ":information_source: Nothing more to do — the request is "
+            + "approved and their access is now active.")))
         .build());
   }
 

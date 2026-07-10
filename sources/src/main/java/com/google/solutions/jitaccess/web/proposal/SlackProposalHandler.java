@@ -208,34 +208,11 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "No qualified reviewers resolved to individual users for " + fp.groupId());
     }
 
-    //
-    // SECOP-1097: skip the fan-out if an equivalent request is already
-    // in flight. The registry key is (beneficiary, group, recipients),
-    // so a live entry means the same person already has reviewer DMs
-    // out for the same group+reviewers — a duplicate submit (multi-tab,
-    // or a retry after a slow first POST). Re-sending would double every
-    // reviewer's DMs and leave a second approvable token dangling.
-    // Fail-open: a registry read error falls through to the normal
-    // fan-out (a duplicate DM batch beats dropping a real request).
-    //
-    try {
-      if (this.registry.lookup(fp.key()).join().isPresent()) {
-        this.logger.info(
-          "slack.onOperationProposed.duplicateSkipped",
-          "A live proposal already exists for %s requesting %s (key=%s); "
-            + "skipping duplicate reviewer notification.",
-          fp.beneficiary(), fp.groupId(), fp.key());
-        return;
-      }
-    }
-    catch (RuntimeException e) {
-      var cause = e.getCause() != null ? e.getCause() : e;
-      this.logger.warn(
-        "slack.duplicateCheck.failed",
-        "Duplicate-proposal check failed for %s on %s; proceeding with "
-          + "notification (fail-open). cause=%s",
-        fp.beneficiary(), fp.groupId(), cause.getMessage());
-    }
+    // SECOP-1101: duplicate rejection has moved to reserveProposal(),
+    // which runs BEFORE the token is minted (in AbstractProposalHandler.
+    // propose) and reserves atomically — replacing the previous
+    // lookup-then-skip here, which ran after minting (so it left a
+    // second live token) and was a non-atomic TOCTOU.
 
     var justification = proposal.input().getOrDefault("justification", "");
 
@@ -438,6 +415,30 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull JitGroupContext.ApprovalOperation operation,
     @NotNull Proposal proposal
   ) throws AccessException, IOException {
+    //
+    // SECOP-1100: this hook runs INSIDE ApprovalOperation.execute(),
+    // AFTER the membership has been granted. Anything thrown here would
+    // propagate out of execute() as a 500 even though access is already
+    // live — and, worse, would skip the caller's markConsumed/audit,
+    // leaving the token replayable. Notification is strictly
+    // post-completion best-effort: swallow everything, log loud.
+    //
+    try {
+      notifyProposalApproved(operation, proposal);
+    }
+    catch (Exception e) {
+      this.logger.error(
+        "slack.onProposalApproved.failed",
+        "Post-approval Slack notification failed for group=%s approver=%s; "
+          + "the approval itself succeeded and is unaffected. cause=%s",
+        proposal.group(), operation.user().email, e.getMessage());
+    }
+  }
+
+  private void notifyProposalApproved(
+    @NotNull JitGroupContext.ApprovalOperation operation,
+    @NotNull Proposal proposal
+  ) throws AccessException, IOException {
     var fp = fingerprint(proposal);
     var approverEmail = operation.user().email;
 
@@ -558,20 +559,25 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   }
 
   /**
-   * SECOP-1093: record consumption after a successful approval.
-   * Best-effort by contract — the approval already succeeded, so a
-   * failed write only restores replayability for this one token; log
-   * loud and move on.
+   * SECOP-1100: atomically claim the token before the approval executes.
+   * The Firestore {@code create()} is the concurrency gate — if two
+   * approvers click the same link at once, exactly one create succeeds
+   * and the other is rejected here, before either grants. Fail-open on
+   * infrastructure errors (availability over replay-protection, same
+   * tradeoff as the SECOP-1093 read), but an explicit already-claimed
+   * result is a hard reject.
    */
   @Override
-  public void markConsumed(@NotNull Proposal proposal) {
+  public void claimForApproval(@NotNull Proposal proposal)
+    throws AccessException {
     var proposalId = proposal.id();
     if (proposalId == null) {
       return;
     }
+    boolean claimed;
     try {
-      this.registry
-        .markProposalConsumed(
+      claimed = this.registry
+        .claimProposalConsumption(
           this.registry.consumptionKey(proposalId),
           proposal.expiry())
         .join();
@@ -579,10 +585,104 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     catch (RuntimeException e) {
       var cause = e.getCause() != null ? e.getCause() : e;
       this.logger.error(
-        "slack.consumption.markFailed",
-        "Failed to record proposal consumption for id=%s; this token "
-          + "remains replayable until it expires at %s. cause=%s",
-        proposalId, proposal.expiry(), cause.getMessage());
+        "slack.consumption.claimFailed",
+        "Failed to claim proposal for id=%s; allowing the approval "
+          + "(fail-open) — replay protection degraded until Firestore "
+          + "recovers. cause=%s",
+        proposalId, cause.getMessage());
+      return;
+    }
+    if (!claimed) {
+      throw new AccessDeniedException(
+        "This approval link has already been used. If further access is "
+          + "needed, ask the requester to submit a new request.");
+    }
+  }
+
+  /**
+   * SECOP-1101: atomically reserve a pending-request marker before a
+   * token is minted. Keyed on (beneficiary, group) for auto-selected
+   * reviewers (presence/affinity may pick a different set on a
+   * re-submit, but it's the same request) and additionally on the
+   * recipient set when the requester picked reviewers. Fail-open on
+   * infrastructure errors — a Firestore outage must not block
+   * elevations (a rare duplicate DM batch beats dropping real requests).
+   */
+  @Override
+  boolean reserveProposal(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected,
+    @NotNull java.time.Instant expiry
+  ) {
+    try {
+      return this.registry
+        .reservePendingProposal(pendingKeyFor(proposal, reviewersAutoSelected), expiry)
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.error(
+        "slack.reserveProposal.failed",
+        "Failed to reserve pending request for %s on %s; allowing "
+          + "(fail-open) — duplicate protection degraded. cause=%s",
+        proposal.user().email, proposal.group(), cause.getMessage());
+      return true;
+    }
+  }
+
+  @Override
+  void releaseProposalReservation(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected
+  ) {
+    try {
+      this.registry
+        .releasePendingProposal(pendingKeyFor(proposal, reviewersAutoSelected))
+        .join();
+    }
+    catch (RuntimeException e) {
+      // Best-effort; TTL reaps.
+    }
+  }
+
+  private @NotNull String pendingKeyFor(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected
+  ) {
+    List<String> recipientEmails = reviewersAutoSelected
+      ? null
+      : proposal.recipients().stream()
+          .filter(EndUserId.class::isInstance)
+          .map(p -> ((EndUserId) p).email)
+          .sorted()
+          .toList();
+    return this.registry.pendingKey(
+      proposal.user().email, proposal.group().toString(), recipientEmails);
+  }
+
+  /**
+   * SECOP-1100: release a claim when the approval didn't complete, so a
+   * legitimate retry can approve. Best-effort — a failed release leaves
+   * the token burned (fail-safe).
+   */
+  @Override
+  public void releaseClaim(@NotNull Proposal proposal) {
+    var proposalId = proposal.id();
+    if (proposalId == null) {
+      return;
+    }
+    try {
+      this.registry
+        .releaseProposalConsumption(this.registry.consumptionKey(proposalId))
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.warn(
+        "slack.consumption.releaseFailed",
+        "Failed to release claim for id=%s; token stays burned until "
+          + "TTL. cause=%s",
+        proposalId, cause.getMessage());
     }
   }
 
