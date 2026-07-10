@@ -76,13 +76,27 @@ public interface ProposalHandler {
    *                       individuals selected by the requester
    * @param notifyReviewers when false, the proposal token is generated
    *                        but no Slack/email notification is delivered
+   * @param reviewersAutoSelected wavemm fork (SECOP-1099): true when the
+   *                              filter was picked by the auto-narrow on
+   *                              the requester's behalf (empty picker
+   *                              selection) rather than by the requester.
+   *                              Handlers use this to tell the requester
+   *                              who was notified and to teach the picker.
    */
   record ProposeOptions(
     @Nullable Set<EndUserId> reviewerFilter,
-    boolean notifyReviewers
+    boolean notifyReviewers,
+    boolean reviewersAutoSelected
   ) {
+    public ProposeOptions(
+      @Nullable Set<EndUserId> reviewerFilter,
+      boolean notifyReviewers
+    ) {
+      this(reviewerFilter, notifyReviewers, false);
+    }
+
     public static final @NotNull ProposeOptions DEFAULT =
-      new ProposeOptions(null, true);
+      new ProposeOptions(null, true, false);
   }
 
   /**

@@ -406,7 +406,20 @@
                 this.formFields = []
                 this.form = this.select('form');
 
-                this.select('button[type="submit"]').unbind('click').click(async () => {
+                // SECOP-1097: guard against double-submit. The POST is slow
+                // on broad roles (Cloud Identity fan-out + reviewer DMs), and
+                // an impatient second click used to mint a second proposal
+                // token and a duplicate reviewer DM batch. Ignore re-entrant
+                // clicks and disable the button while the request is in flight.
+                this._submitting = false;
+                const submitButton = this.select('button[type="submit"]');
+                submitButton.unbind('click').click(async () => {
+                    if (this._submitting) {
+                        return;
+                    }
+                    this._submitting = true;
+                    submitButton.prop('disabled', true);
+
                     var dialog = new WaitDialog();
                     dialog.showAsync();
 
@@ -418,6 +431,8 @@
                     }
                     finally {
                         dialog.close();
+                        this._submitting = false;
+                        submitButton.prop('disabled', false);
                     }
                 });
             }
@@ -962,8 +977,21 @@
                     });
                 }
                 else if (groupInfo.join.status == 'JOIN_PROPOSED') {
+                    // SECOP-1099: name the notified reviewers, and when the
+                    // set was auto-picked, teach the picker.
+                    let secondary = undefined;
+                    if (groupInfo.join.notifiedReviewers &&
+                        groupInfo.join.notifiedReviewers.length > 0) {
+                        secondary = groupInfo.join.reviewersAutoSelected
+                            ? "Sent to what we think are your closest teammates " +
+                              "(since you didn't pick anyone specifically): " +
+                              groupInfo.join.notifiedReviewers.join(", ") +
+                              " — next time you can choose reviewers with the picker above."
+                            : "Sent to: " + groupInfo.join.notifiedReviewers.join(", ");
+                    }
                     this.membership.addRow({
                         primary: "Your request to join the group was sent for approval",
+                        secondary: secondary,
                         icon: 'outgoing_mail'
                     });
                 }

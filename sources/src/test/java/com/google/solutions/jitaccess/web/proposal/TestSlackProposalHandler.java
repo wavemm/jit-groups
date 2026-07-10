@@ -380,6 +380,117 @@ public class TestSlackProposalHandler {
   // ---------------------------------------------------------------------
 
   // -------------------------------------------------------------------------
+  // Duplicate-proposal skip (SECOP-1097).
+  // -------------------------------------------------------------------------
+
+  /**
+   * SECOP-1097: if a live registry entry already exists for the same
+   * (beneficiary, group, recipients), the fan-out is skipped — no
+   * duplicate reviewer DMs on a double-submit.
+   */
+  @Test
+  public void onOperationProposed_whenLiveEntryExists_skipsFanOut()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("dup-key");
+    when(registry.lookup(eq("dup-key")))
+      .thenReturn(CompletableFuture.completedFuture(Optional.of(List.of(
+        new SlackMessageRegistry.ReviewerMessage(
+          "bob@example.com", "U-BOB", "C-BOB", "111.111")))));
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var recipients = Set.<IamPrincipalId>of(BOB, CAROL);
+    handler.onOperationProposed(
+      operationFor(ALICE), proposalFor(ALICE, recipients),
+      tokenFor(recipients), ACTION_URI);
+
+    // No DMs posted, no new registry write.
+    verify(slack, never()).postDirectMessage(anyString(), anyList(), anyString());
+    verify(registry, never()).record(anyString(), anyList(), any());
+  }
+
+  /**
+   * SECOP-1097 fail-open: a registry read error must not drop a real
+   * request — the fan-out proceeds.
+   */
+  @Test
+  public void onOperationProposed_whenDuplicateCheckErrors_proceeds()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.requestKey(anyString(), anyString(), anyList()))
+      .thenReturn("k");
+    when(registry.lookup(eq("k")))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore down")));
+    when(registry.record(anyString(), anyList(), any()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    var recipients = Set.<IamPrincipalId>of(BOB);
+    handler.onOperationProposed(
+      operationFor(ALICE), proposalFor(ALICE, recipients),
+      tokenFor(recipients), ACTION_URI);
+
+    verify(slack, atLeastOnce()).postDirectMessage(anyString(), anyList(), anyString());
+  }
+
+  // -------------------------------------------------------------------------
+  // Requester visibility on auto-selected reviewers (SECOP-1099).
+  // -------------------------------------------------------------------------
+
+  /**
+   * SECOP-1099: when the reviewer set was auto-picked, the requester
+   * gets a propose-time DM naming who was notified. When they picked
+   * themselves (options.DEFAULT), no such DM — they already know.
+   */
+  @Test
+  public void onOperationProposed_whenAutoSelected_dmsRequesterWithNotifiedList()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = registryHappyPath();
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    handler.onOperationProposed(
+      mock(JitGroupContext.JoinOperation.class),
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL)),
+      tokenFor(Set.<IamPrincipalId>of(BOB, CAROL)),
+      ACTION_URI,
+      new ProposalHandler.ProposeOptions(
+        Set.of(BOB, CAROL), true, /*reviewersAutoSelected*/ true));
+
+    // Reviewer DMs to Bob and Carol, plus one to Alice (the requester)
+    // naming the auto-selected set.
+    verify(slack).lookupUserByEmail(eq("alice@example.com"));
+    var fallbacks = ArgumentCaptor.forClass(String.class);
+    verify(slack, times(3)).postDirectMessage(anyString(), anyList(), fallbacks.capture());
+    assertTrue(fallbacks.getAllValues().stream()
+      .anyMatch(f -> f.contains("closest teammates")));
+  }
+
+  @Test
+  public void onOperationProposed_whenUserPicked_noRequesterDm()
+    throws Exception {
+    var slack = slackClientHappyPath();
+    var registry = registryHappyPath();
+    var handler = newHandler(slack, registry, groupResolverPassthrough());
+
+    handler.onOperationProposed(
+      mock(JitGroupContext.JoinOperation.class),
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)),
+      tokenFor(Set.<IamPrincipalId>of(BOB)),
+      ACTION_URI,
+      new ProposalHandler.ProposeOptions(
+        Set.of(BOB), true, /*reviewersAutoSelected*/ false));
+
+    // Only Bob's reviewer DM; the requester is never looked up.
+    verify(slack, times(1)).postDirectMessage(anyString(), anyList(), anyString());
+    verify(slack, never()).lookupUserByEmail(eq("alice@example.com"));
+  }
+
+  // -------------------------------------------------------------------------
   // verifyNotConsumed / markConsumed (SECOP-1093).
   // -------------------------------------------------------------------------
 

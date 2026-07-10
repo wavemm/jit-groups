@@ -195,6 +195,39 @@ final class SlackMessages {
   }
 
   /**
+   * DM to the requester right after an empty-selection propose
+   * (SECOP-1099): names the auto-selected reviewers and teaches the
+   * picker. Only sent when the reviewer set was picked on the
+   * requester's behalf — requesters who picked already know.
+   */
+  static List<LayoutBlock> beneficiaryProposed(
+    @NotNull String groupId,
+    @NotNull List<String> notifiedEmails
+  ) {
+    var names = String.join(", ", notifiedEmails);
+    return List.of(
+      HeaderBlock.builder()
+        .text(plain(":incoming_envelope: Request sent for approval"))
+        .build(),
+      SectionBlock.builder()
+        .fields(List.of(
+          markdownField("*Group*", "`" + groupId + "`")
+        ))
+        .build(),
+      SectionBlock.builder()
+        .text(markdown(
+          "Since you didn't pick anyone specifically, we sent it to "
+            + "*what we think are your closest teammates*:\n"
+            + truncateForBlock(names)))
+        .build(),
+      ContextBlock.builder()
+        .elements(List.of(markdown(
+          ":bulb: Next time you can choose who reviews it — use the "
+            + "\"Select reviewers\" picker on the request page.")))
+        .build());
+  }
+
+  /**
    * DM to the beneficiary confirming the activation completed.
    */
   static List<LayoutBlock> beneficiaryApproved(
@@ -232,6 +265,12 @@ final class SlackMessages {
 
   static String reviewerApprovedByYouFallback(@NotNull String requesterEmail) {
     return "You approved " + requesterEmail + "'s request — nothing more to do.";
+  }
+
+  static String beneficiaryProposedFallback(@NotNull String groupId) {
+    return String.format(
+      "Your request for %s was sent to your closest teammates for approval.",
+      groupId);
   }
 
   static String beneficiaryApprovedFallback(@NotNull String groupId, @NotNull String approverEmail) {
