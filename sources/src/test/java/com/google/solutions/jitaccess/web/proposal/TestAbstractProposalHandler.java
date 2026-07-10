@@ -39,6 +39,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
@@ -205,6 +206,18 @@ public class TestAbstractProposalHandler {
     var proposal = proposalHandler.accept(token);
 
     assertEquals("abc123", proposal.id());
+  }
+
+  /**
+   * SECOP-1098: handlers without a presence signal (here the sample /
+   * mail / debug handlers) inherit the no-op default and return the
+   * affinity order unchanged.
+   */
+  @Test
+  public void rankReviewersByAvailability_defaultIsPassthrough() {
+    var handler = new SampleProposalHandler(new PseudoSigner());
+    var input = List.of(SAMPLE_USER_1, SAMPLE_USER_2);
+    assertEquals(input, handler.rankReviewersByAvailability(SAMPLE_USER_1, input));
   }
 
   @Test

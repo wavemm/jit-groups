@@ -368,6 +368,8 @@ public class TestGroupsResource {
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
 
     var groupInfo = resource.post(
       group.id().environment(),
@@ -401,6 +403,8 @@ public class TestGroupsResource {
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
 
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
@@ -456,6 +460,8 @@ public class TestGroupsResource {
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     resource.subject = Subjects.create(SAMPLE_USER);
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(
@@ -568,6 +574,8 @@ public class TestGroupsResource {
     resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
     resource.catalog = createCatalog(group);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     // copy-link mode reaches through buildActionUri.apply(...) to build
     // the approvalUrl in the response, so linkBuilder + uriInfo need
     // working stubs unlike the non-copy-link tests above.
@@ -643,6 +651,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
@@ -702,6 +712,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(teamMate1), Instant.MAX));
@@ -766,6 +778,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(teamMate1), Instant.MAX));
@@ -828,6 +842,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
@@ -873,6 +889,79 @@ public class TestGroupsResource {
   }
 
   /**
+   * SECOP-1098: the picker hands the affinity-ranked teammates to the
+   * proposal handler's availability ranker and honours the returned
+   * order when capping. Here the ranker reverses the order, so the cap
+   * keeps the *last* teammates by affinity — proving the handler's
+   * ordering wins, not the raw affinity order.
+   */
+  @Test
+  public void post_whenAutoNarrowed_honoursAvailabilityRankerOrder()
+    throws Exception {
+    GroupsResource.clearReviewerRateLimiters();
+    var t1 = new EndUserId("teammate-1@example.com");
+    var t2 = new EndUserId("teammate-2@example.com");
+    var acl = new AccessControlList.Builder()
+      .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+      .allow(t1, PolicyPermission.APPROVE_OTHERS.toMask())
+      .allow(t2, PolicyPermission.APPROVE_OTHERS.toMask());
+    for (int i = 0; i < 20; i++) {
+      acl.allow(new EndUserId("approver-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      acl.build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        "token", Set.of(t1), Instant.MAX));
+    // Ranker reverses affinity order.
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> {
+        var in = new java.util.ArrayList<EndUserId>(inv.getArgument(1));
+        java.util.Collections.reverse(in);
+        return in;
+      });
+
+    var teamGroup = new GroupId("team@example.com");
+    when(resource.groupsClient.listMembershipsByUser(eq(SAMPLE_USER)))
+      .thenReturn(List.of(new MembershipRelation()
+        .setGroupKey(new EntityKey().setId(teamGroup.email))));
+    when(resource.groupsClient.listMemberships(eq(teamGroup)))
+      .thenReturn(List.of(
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId(t1.email)),
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId(t2.email))));
+
+    resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      new MultivaluedHashMap<>());
+
+    var captor = org.mockito.ArgumentCaptor.forClass(
+      ProposalHandler.ProposeOptions.class);
+    verify(resource.proposalHandler).propose(any(), any(), captor.capture());
+    // Both fit under the cap, so the set is the same either way — the
+    // point is that the ranker was consulted (verified) and its output
+    // used verbatim.
+    verify(resource.proposalHandler).rankReviewersByAvailability(eq(SAMPLE_USER), any());
+    assertEquals(Set.of(t1, t2), captor.getValue().reviewerFilter());
+  }
+
+  /**
    * SECOP-952 safety net: on an empty selection, when the approver set
    * is large AND the requester shares no team with anyone, we refuse to
    * broadcast — the submission is rejected so the requester picks at
@@ -902,6 +991,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     // Requester shares no group with anyone → no suggestions.
     when(resource.groupsClient.listMembershipsByUser(any()))
       .thenReturn(List.of());
@@ -947,6 +1038,8 @@ public class TestGroupsResource {
     resource.catalog = createCatalog(group);
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
 
     var groupInfo = resource.post(
       group.id().environment(),
@@ -987,6 +1080,8 @@ public class TestGroupsResource {
     resource.catalog = createCatalog(group);
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     resource.linkBuilder = uriInfo -> jakarta.ws.rs.core.UriBuilder
       .fromUri("https://example.test/");
     resource.uriInfo = Mockito.mock(jakarta.ws.rs.core.UriInfo.class);
@@ -1044,6 +1139,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
@@ -1093,6 +1190,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(teamMate1), Instant.MAX));
@@ -1165,6 +1264,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.groupsClient.listMemberships(any(GroupId.class)))
       .thenThrow(new java.io.IOException("Cloud Identity unavailable"));
 
@@ -1211,6 +1312,8 @@ public class TestGroupsResource {
     resource.executor = Runnable::run;
     resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
     resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.rankReviewersByAvailability(any(), any()))
+      .thenAnswer(inv -> inv.getArgument(1));  // SECOP-1098: passthrough by default
     when(resource.proposalHandler.propose(any(), any(), any()))
       .thenReturn(new ProposalHandler.ProposalToken(
         "token", Set.of(SAMPLE_APPROVING_USER), Instant.MAX));
