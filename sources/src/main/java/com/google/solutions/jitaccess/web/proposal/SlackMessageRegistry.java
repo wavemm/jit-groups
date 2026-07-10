@@ -57,6 +57,7 @@ public class SlackMessageRegistry {
   static final String FIELD_REVIEWERS = "reviewers";
   static final String FIELD_EXPIRES_AT = "expires_at";
   static final String FIELD_CONSUMED = "consumed";
+  static final String FIELD_PENDING = "pending";
 
   private final @NotNull Firestore firestore;
   private final @NotNull Executor executor;
@@ -144,6 +145,116 @@ public class SlackMessageRegistry {
    */
   public @NotNull String consumptionKey(@NotNull String proposalId) {
     return hmacHex("consumed|" + proposalId);
+  }
+
+  /**
+   * Key of the pending-request reservation (SECOP-1101), used to reject
+   * duplicate in-flight requests. Namespaced "pending|" (distinct from
+   * request/consumption docs) and HMAC'd like the others.
+   *
+   * <p>When {@code recipientEmails} is null the key is keyed only on
+   * (beneficiary, group) — for auto-selected reviewers, whose exact set
+   * can shift between a requester's re-submits (e.g. presence-ranked),
+   * so a re-submit is still recognised as the same request. When
+   * non-null (the requester picked reviewers), the recipients are part
+   * of the key: deliberately picking a different set is a new request.
+   */
+  public @NotNull String pendingKey(
+    @NotNull String beneficiary,
+    @NotNull String groupId,
+    @org.jetbrains.annotations.Nullable List<String> recipientEmails
+  ) {
+    var canonical = new StringBuilder("pending|")
+      .append(beneficiary).append('|').append(groupId);
+    if (recipientEmails != null) {
+      canonical.append('|')
+        .append(String.join(",", recipientEmails.stream().sorted().toList()));
+    }
+    return hmacHex(canonical.toString());
+  }
+
+  /**
+   * Atomically reserve a pending-request marker (SECOP-1101). Returns
+   * {@code true} if this caller took the reservation, {@code false} if a
+   * live (non-expired) one already exists. Firestore {@code create()}
+   * makes concurrent first-time reservations mutually exclusive (fixes
+   * the lookup/record TOCTOU); an existing-but-EXPIRED marker is treated
+   * as free and overwritten (fixes the up-to-24h stale-entry lockout,
+   * since the TTL reaper lags — we compare {@code expires_at} to now
+   * rather than trusting deletion).
+   */
+  public @NotNull CompletableFuture<Boolean> reservePendingProposal(
+    @NotNull String pendingKey,
+    @NotNull Instant expiresAt
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      var doc = new HashMap<String, Object>();
+      doc.put(FIELD_EXPIRES_AT, Timestamp.ofTimeSecondsAndNanos(
+        expiresAt.getEpochSecond(), expiresAt.getNano()));
+      doc.put(FIELD_PENDING, true);
+      var ref = collection().document(pendingKey);
+      try {
+        ref.create(doc).get();
+        return true;
+      }
+      catch (ExecutionException e) {
+        if (!isAlreadyExists(e.getCause())) {
+          throw new RuntimeException(
+            "Failed to reserve pending proposal " + pendingKey, e);
+        }
+        // A marker exists — reuse it only if it's a live request.
+        try {
+          var snapshot = ref.get().get();
+          var existingExpiry = snapshot.getTimestamp(FIELD_EXPIRES_AT);
+          var live = existingExpiry != null
+            && existingExpiry.toDate().toInstant().isAfter(Instant.now());
+          if (live) {
+            return false;
+          }
+          // Stale (or malformed) — take it over.
+          ref.set(doc).get();
+          return true;
+        }
+        catch (ExecutionException e2) {
+          throw new RuntimeException(
+            "Failed to reconcile stale pending reservation " + pendingKey, e2);
+        }
+        catch (InterruptedException e2) {
+          Thread.currentThread().interrupt();
+          throw new RuntimeException(
+            "Interrupted reconciling pending reservation " + pendingKey, e2);
+        }
+      }
+      catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(
+          "Interrupted reserving pending proposal " + pendingKey, e);
+      }
+    }, this.executor);
+  }
+
+  /**
+   * Release a pending reservation (SECOP-1101) so a legitimate retry can
+   * proceed after a failed propose. Best-effort; TTL reaps otherwise.
+   */
+  public @NotNull CompletableFuture<Void> releasePendingProposal(
+    @NotNull String pendingKey
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      try {
+        collection().document(pendingKey).delete().get();
+      }
+      catch (ExecutionException e) {
+        this.logger.warn(
+          "slackRegistry.releasePending.failed",
+          "Failed to release pending reservation %s (TTL will reap): %s",
+          pendingKey, e.getMessage());
+      }
+      catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      return null;
+    }, this.executor);
   }
 
   private @NotNull String hmacHex(@NotNull String canonical) {

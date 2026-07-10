@@ -208,34 +208,11 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "No qualified reviewers resolved to individual users for " + fp.groupId());
     }
 
-    //
-    // SECOP-1097: skip the fan-out if an equivalent request is already
-    // in flight. The registry key is (beneficiary, group, recipients),
-    // so a live entry means the same person already has reviewer DMs
-    // out for the same group+reviewers — a duplicate submit (multi-tab,
-    // or a retry after a slow first POST). Re-sending would double every
-    // reviewer's DMs and leave a second approvable token dangling.
-    // Fail-open: a registry read error falls through to the normal
-    // fan-out (a duplicate DM batch beats dropping a real request).
-    //
-    try {
-      if (this.registry.lookup(fp.key()).join().isPresent()) {
-        this.logger.info(
-          "slack.onOperationProposed.duplicateSkipped",
-          "A live proposal already exists for %s requesting %s (key=%s); "
-            + "skipping duplicate reviewer notification.",
-          fp.beneficiary(), fp.groupId(), fp.key());
-        return;
-      }
-    }
-    catch (RuntimeException e) {
-      var cause = e.getCause() != null ? e.getCause() : e;
-      this.logger.warn(
-        "slack.duplicateCheck.failed",
-        "Duplicate-proposal check failed for %s on %s; proceeding with "
-          + "notification (fail-open). cause=%s",
-        fp.beneficiary(), fp.groupId(), cause.getMessage());
-    }
+    // SECOP-1101: duplicate rejection has moved to reserveProposal(),
+    // which runs BEFORE the token is minted (in AbstractProposalHandler.
+    // propose) and reserves atomically — replacing the previous
+    // lookup-then-skip here, which ran after minting (so it left a
+    // second live token) and was a non-atomic TOCTOU.
 
     var justification = proposal.input().getOrDefault("justification", "");
 
@@ -620,6 +597,67 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         "This approval link has already been used. If further access is "
           + "needed, ask the requester to submit a new request.");
     }
+  }
+
+  /**
+   * SECOP-1101: atomically reserve a pending-request marker before a
+   * token is minted. Keyed on (beneficiary, group) for auto-selected
+   * reviewers (presence/affinity may pick a different set on a
+   * re-submit, but it's the same request) and additionally on the
+   * recipient set when the requester picked reviewers. Fail-open on
+   * infrastructure errors — a Firestore outage must not block
+   * elevations (a rare duplicate DM batch beats dropping real requests).
+   */
+  @Override
+  boolean reserveProposal(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected,
+    @NotNull java.time.Instant expiry
+  ) {
+    try {
+      return this.registry
+        .reservePendingProposal(pendingKeyFor(proposal, reviewersAutoSelected), expiry)
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.error(
+        "slack.reserveProposal.failed",
+        "Failed to reserve pending request for %s on %s; allowing "
+          + "(fail-open) — duplicate protection degraded. cause=%s",
+        proposal.user().email, proposal.group(), cause.getMessage());
+      return true;
+    }
+  }
+
+  @Override
+  void releaseProposalReservation(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected
+  ) {
+    try {
+      this.registry
+        .releasePendingProposal(pendingKeyFor(proposal, reviewersAutoSelected))
+        .join();
+    }
+    catch (RuntimeException e) {
+      // Best-effort; TTL reaps.
+    }
+  }
+
+  private @NotNull String pendingKeyFor(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected
+  ) {
+    List<String> recipientEmails = reviewersAutoSelected
+      ? null
+      : proposal.recipients().stream()
+          .filter(EndUserId.class::isInstance)
+          .map(p -> ((EndUserId) p).email)
+          .sorted()
+          .toList();
+    return this.registry.pendingKey(
+      proposal.user().email, proposal.group().toString(), recipientEmails);
   }
 
   /**

@@ -37,7 +37,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
 
 public class TestSlackProposalHandler {
@@ -384,57 +386,86 @@ public class TestSlackProposalHandler {
   // -------------------------------------------------------------------------
 
   /**
-   * SECOP-1097: if a live registry entry already exists for the same
-   * (beneficiary, group, recipients), the fan-out is skipped — no
-   * duplicate reviewer DMs on a double-submit.
+   * SECOP-1101: reserveProposal takes an atomic pending reservation and
+   * reports duplicates. Auto-selected reviewers key on (beneficiary,
+   * group) only — recipients are NOT part of the key, so a re-submit
+   * whose picked set shifted is still recognised as the same request.
    */
   @Test
-  public void onOperationProposed_whenLiveEntryExists_skipsFanOut()
-    throws Exception {
-    var slack = slackClientHappyPath();
+  public void reserveProposal_autoSelected_keysOnBeneficiaryAndGroup() {
     var registry = mock(SlackMessageRegistry.class);
-    when(registry.requestKey(anyString(), anyString(), anyList()))
-      .thenReturn("dup-key");
-    when(registry.lookup(eq("dup-key")))
-      .thenReturn(CompletableFuture.completedFuture(Optional.of(List.of(
-        new SlackMessageRegistry.ReviewerMessage(
-          "bob@example.com", "U-BOB", "C-BOB", "111.111")))));
-    var handler = newHandler(slack, registry, groupResolverPassthrough());
+    when(registry.pendingKey(eq("alice@example.com"), anyString(), isNull()))
+      .thenReturn("pending-key");
+    when(registry.reservePendingProposal(eq("pending-key"), any()))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
 
-    var recipients = Set.<IamPrincipalId>of(BOB, CAROL);
-    handler.onOperationProposed(
-      operationFor(ALICE), proposalFor(ALICE, recipients),
-      tokenFor(recipients), ACTION_URI);
+    var reserved = handler.reserveProposal(
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL)),
+      /*reviewersAutoSelected*/ true,
+      Instant.now().plus(Duration.ofHours(1)));
 
-    // No DMs posted, no new registry write.
-    verify(slack, never()).postDirectMessage(anyString(), anyList(), anyString());
-    verify(registry, never()).record(anyString(), anyList(), any());
+    assertTrue(reserved);
+    // recipients omitted from the key (null) for the auto-selected case.
+    verify(registry).pendingKey(eq("alice@example.com"), anyString(), isNull());
   }
 
   /**
-   * SECOP-1097 fail-open: a registry read error must not drop a real
-   * request — the fan-out proceeds.
+   * SECOP-1101: a picked reviewer set is part of the key (non-null
+   * recipient list) — deliberately choosing different reviewers is a
+   * new request.
    */
   @Test
-  public void onOperationProposed_whenDuplicateCheckErrors_proceeds()
-    throws Exception {
-    var slack = slackClientHappyPath();
+  public void reserveProposal_userPicked_keysOnRecipients() {
     var registry = mock(SlackMessageRegistry.class);
-    when(registry.requestKey(anyString(), anyString(), anyList()))
-      .thenReturn("k");
-    when(registry.lookup(eq("k")))
+    when(registry.pendingKey(eq("alice@example.com"), anyString(), anyList()))
+      .thenReturn("pending-key");
+    when(registry.reservePendingProposal(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    handler.reserveProposal(
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB, CAROL)),
+      /*reviewersAutoSelected*/ false,
+      Instant.now().plus(Duration.ofHours(1)));
+
+    verify(registry).pendingKey(eq("alice@example.com"), anyString(),
+      argThat(list -> list != null && list.size() == 2));
+  }
+
+  /** SECOP-1101: a live reservation → duplicate → reserveProposal false. */
+  @Test
+  public void reserveProposal_reportsDuplicate() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.pendingKey(anyString(), anyString(), any()))
+      .thenReturn("pending-key");
+    when(registry.reservePendingProposal(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    assertFalse(handler.reserveProposal(
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)), true,
+      Instant.now().plus(Duration.ofHours(1))));
+  }
+
+  /** SECOP-1101 fail-open: a reservation error must not block the request. */
+  @Test
+  public void reserveProposal_failsOpenOnRegistryError() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.pendingKey(anyString(), anyString(), any()))
+      .thenReturn("pending-key");
+    when(registry.reservePendingProposal(anyString(), any()))
       .thenReturn(CompletableFuture.failedFuture(
         new RuntimeException("firestore down")));
-    when(registry.record(anyString(), anyList(), any()))
-      .thenReturn(CompletableFuture.completedFuture(null));
-    var handler = newHandler(slack, registry, groupResolverPassthrough());
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
 
-    var recipients = Set.<IamPrincipalId>of(BOB);
-    handler.onOperationProposed(
-      operationFor(ALICE), proposalFor(ALICE, recipients),
-      tokenFor(recipients), ACTION_URI);
-
-    verify(slack, atLeastOnce()).postDirectMessage(anyString(), anyList(), anyString());
+    assertTrue(handler.reserveProposal(
+      proposalFor(ALICE, Set.<IamPrincipalId>of(BOB)), true,
+      Instant.now().plus(Duration.ofHours(1))));
   }
 
   // -------------------------------------------------------------------------
