@@ -731,6 +731,62 @@ public class TestGroupsResource {
       Set.of(teamMate1, teamMate2),
       captor.getValue().reviewerFilter(),
       "empty selection on a broad set must narrow to teammates");
+    assertTrue(captor.getValue().reviewersAutoSelected(),
+      "the auto-narrow must flag the selection as made on the requester's behalf");
+  }
+
+  /**
+   * SECOP-1099: the JOIN_PROPOSED response tells the requester who was
+   * notified and that the choice was auto-made, so the UI can render
+   * the "we picked for you — use the picker next time" explainer.
+   */
+  @Test
+  public void post_whenAutoNarrowed_responseCarriesNotifiedReviewers()
+    throws Exception {
+    GroupsResource.clearReviewerRateLimiters();
+    var teamMate1 = new EndUserId("teammate-1@example.com");
+    var acl = new AccessControlList.Builder()
+      .allow(SAMPLE_USER, PolicyPermission.JOIN.toMask())
+      .allow(teamMate1, PolicyPermission.APPROVE_OTHERS.toMask());
+    for (int i = 0; i < 20; i++) {
+      acl.allow(new EndUserId("approver-" + i + "@example.com"),
+        PolicyPermission.APPROVE_OTHERS.toMask());
+    }
+    var group = Policies.createJitGroupPolicy(
+      "g-1",
+      acl.build(),
+      Map.of(Policy.ConstraintClass.JOIN, List.of(new ExpiryConstraint(Duration.ofMinutes(1)))));
+
+    var resource = new GroupsResource();
+    resource.options = new GroupsResource.Options(false);
+    resource.logger = Mockito.mock(Logger.class);
+    resource.auditTrail = Mockito.mock(OperationAuditTrail.class);
+    resource.catalog = createCatalog(group);
+    resource.subject = Subjects.create(SAMPLE_USER);
+    resource.executor = Runnable::run;
+    resource.groupsClient = Mockito.mock(CloudIdentityGroupsClient.class);
+    resource.proposalHandler = Mockito.mock(ProposalHandler.class);
+    when(resource.proposalHandler.propose(any(), any(), any()))
+      .thenReturn(new ProposalHandler.ProposalToken(
+        "token", Set.of(teamMate1), Instant.MAX));
+
+    var teamGroup = new GroupId("team@example.com");
+    when(resource.groupsClient.listMembershipsByUser(eq(SAMPLE_USER)))
+      .thenReturn(List.of(new MembershipRelation()
+        .setGroupKey(new EntityKey().setId(teamGroup.email))));
+    when(resource.groupsClient.listMemberships(eq(teamGroup)))
+      .thenReturn(List.of(
+        new Membership().setType("user")
+          .setPreferredMemberKey(new EntityKey().setId(teamMate1.email))));
+
+    var groupInfo = resource.post(
+      group.id().environment(),
+      group.id().system(),
+      group.id().name(),
+      new MultivaluedHashMap<>());
+
+    assertTrue(groupInfo.join().reviewersAutoSelected());
+    assertEquals(List.of(teamMate1.email), groupInfo.join().notifiedReviewers());
   }
 
   /**

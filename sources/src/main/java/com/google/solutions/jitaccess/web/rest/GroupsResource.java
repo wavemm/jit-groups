@@ -229,6 +229,7 @@ public class GroupsResource {
         //    Slack DMs — narrow to the requester's teammates.
         //
         Set<EndUserId> effectiveReviewers;
+        boolean reviewersAutoSelected = false;
         if (selectedReviewers != null && !selectedReviewers.isEmpty()) {
           effectiveReviewers = selectedReviewers;
         }
@@ -237,6 +238,7 @@ public class GroupsResource {
         }
         else {
           effectiveReviewers = autoNarrowedReviewers(group, groupId);
+          reviewersAutoSelected = effectiveReviewers != null;
         }
 
         //
@@ -263,7 +265,8 @@ public class GroupsResource {
           buildActionUri,
           new ProposalHandler.ProposeOptions(
             effectiveReviewers,
-            notifyReviewers));
+            notifyReviewers,
+            reviewersAutoSelected));
 
         // Plumb the notifyReviewers flag into the audit event so the
         // log-based BigQuery dashboard distinguishes copy-link
@@ -282,12 +285,20 @@ public class GroupsResource {
           ? buildActionUri.apply(proposal.value()).toString()
           : null;
 
+        // SECOP-1099: surface who was notified so the requester learns
+        // the auto-pick happened and that the picker exists.
+        var notifiedReviewers = effectiveReviewers == null
+          ? null
+          : effectiveReviewers.stream().map(u -> u.email).sorted().toList();
+
         return GroupInfo.create(
           group,
           JoinInfo.forProposal(
             joinOp.input(),
             approvalUrl,
-            this.options.slackCopyLinkEnabled()));
+            this.options.slackCopyLinkEnabled(),
+            notifiedReviewers,
+            reviewersAutoSelected));
       }
       else {
         //
@@ -856,7 +867,16 @@ public class GroupsResource {
     /** Mirrors the SLACK_COPY_LINK_ENABLED env flag. The picker UI uses
      *  this to decide whether to render the "Notify reviewers in Slack"
      *  checkbox and the copy-approval-link affordance. */
-    boolean copyLinkEnabled
+    boolean copyLinkEnabled,
+    /** SECOP-1099: emails the proposal was sent to — non-null only when
+     *  status is JOIN_PROPOSED and a reviewer filter was applied (picked
+     *  or auto-selected). Null when the proposal went to the raw policy
+     *  ACL. */
+    @Nullable List<String> notifiedReviewers,
+    /** SECOP-1099: true when {@code notifiedReviewers} was picked on the
+     *  requester's behalf by the auto-narrow (empty picker selection) —
+     *  the UI uses this to render the "we picked for you" explainer. */
+    boolean reviewersAutoSelected
   ) {
     static @NotNull GroupsResource.JoinInfo forJoinAnalysis(
       @NotNull JitGroupContext g,
@@ -897,7 +917,9 @@ public class GroupsResource {
           .map(InputInfo::fromProperty)
           .toList(),
         null,
-        copyLinkEnabled);
+        copyLinkEnabled,
+        null,
+        false);
     }
 
     static @NotNull GroupsResource.JoinInfo forCompletedJoin(
@@ -919,19 +941,23 @@ public class GroupsResource {
           .map(InputInfo::fromProperty)
           .toList(),
         null,
+        false,
+        null,
         false);
     }
 
     static @NotNull GroupsResource.JoinInfo forProposal(
       @NotNull List<Property> input
     ) {
-      return forProposal(input, null, false);
+      return forProposal(input, null, false, null, false);
     }
 
     static @NotNull GroupsResource.JoinInfo forProposal(
       @NotNull List<Property> input,
       @Nullable String approvalUrl,
-      boolean copyLinkEnabled
+      boolean copyLinkEnabled,
+      @Nullable List<String> notifiedReviewers,
+      boolean reviewersAutoSelected
     ) {
       return new JoinInfo(
         JoinStatusInfo.JOIN_PROPOSED,
@@ -944,7 +970,9 @@ public class GroupsResource {
           .map(InputInfo::fromProperty)
           .toList(),
         approvalUrl,
-        copyLinkEnabled);
+        copyLinkEnabled,
+        notifiedReviewers,
+        reviewersAutoSelected);
     }
   }
 

@@ -69,6 +69,23 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
     ) throws AccessException, IOException;
 
   /**
+   * Options-aware variant (wavemm fork, SECOP-1099). The base
+   * implementation ignores the options so existing handlers (mail,
+   * debug) stay unchanged; handlers that care (Slack) override this
+   * one — e.g. to tell the requester who was auto-notified when the
+   * reviewer set was picked on their behalf.
+   */
+  void onOperationProposed(
+    @NotNull JitGroupContext.JoinOperation operation,
+    @NotNull Proposal proposal,
+    @NotNull ProposalHandler.ProposalToken token,
+    @NotNull URI actionUri,
+    @NotNull ProposalHandler.ProposeOptions options
+  ) throws AccessException, IOException {
+    onOperationProposed(operation, proposal, token, actionUri);
+  }
+
+  /**
    * Notify relevant users about the completion of a proposal.
    */
   abstract void onProposalApproved(
@@ -150,7 +167,8 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
           joinOperation,
           proposal,
           proposalToken,
-          buildActionUri.apply(proposalToken.value()));
+          buildActionUri.apply(proposalToken.value()),
+          options);
       }
 
       return proposalToken;

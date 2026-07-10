@@ -41,10 +41,57 @@ import java.util.function.Consumer;
 public abstract class AbstractIamClient {
   private static final int MAX_SET_IAM_POLICY_ATTEMPTS = 4;
 
+  /**
+   * Bounded retries for the "member not in permitted organization"
+   * propagation race (SECOP-1096). Separate budget from the
+   * concurrency-control attempts so a slow propagation can't starve
+   * 412 handling. 3 attempts at 2s/4s/8s ≈ 14s covers the lag observed
+   * in production (a newly-created JIT group took ~15–26s to become
+   * resolvable by the org-policy member-domain checker).
+   */
+  private static final int MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS = 3;
+
   private static boolean isRoleNotGrantableErrorMessage(@Nullable String message)
   {
     return message != null &&
       (message.contains("not supported") || message.contains("does not exist"));
+  }
+
+  /**
+   * True for the transient 400 raised when a binding names a principal
+   * the {@code iam.allowedPolicyMemberDomains} org-policy checker can't
+   * yet resolve — the dominant cause being a Google group created
+   * moments earlier (JIT lazily provisions the group on first join,
+   * then immediately tries to bind it org-wide). Membership propagation
+   * clears within tens of seconds, so this is retryable; a genuinely
+   * disallowed member simply exhausts the bounded retries and surfaces
+   * as before. Deliberately narrow (both the constraint id AND the
+   * status) so we never silently swallow a real domain-restriction
+   * denial as "transient".
+   */
+  static boolean isMemberDomainPropagationError(@NotNull GoogleJsonResponseException e) {
+    if (e.getStatusCode() != 400) {
+      return false;
+    }
+    var sb = new StringBuilder();
+    if (e.getMessage() != null) {
+      sb.append(e.getMessage());
+    }
+    if (e.getDetails() != null) {
+      if (e.getDetails().getMessage() != null) {
+        sb.append('\n').append(e.getDetails().getMessage());
+      }
+      if (e.getDetails().getErrors() != null) {
+        e.getDetails().getErrors().forEach(err -> {
+          if (err.getMessage() != null) {
+            sb.append('\n').append(err.getMessage());
+          }
+        });
+      }
+    }
+    var haystack = sb.toString().toLowerCase();
+    return haystack.contains("allowedpolicymemberdomains")
+      || haystack.contains("not in permitted organization");
   }
 
   /**
@@ -99,6 +146,7 @@ public abstract class AbstractIamClient {
       // IAM policies use optimistic concurrency control, so we might need to perform
       // multiple attempts to update the policy.
       //
+      int memberDomainRetries = 0;
       for (int attempt = 0; attempt < MAX_SET_IAM_POLICY_ATTEMPTS; attempt++) {
         //
         // Read current version of policy.
@@ -147,6 +195,23 @@ public abstract class AbstractIamClient {
             }
             catch (InterruptedException ignored) {
             }
+          }
+          else if (isMemberDomainPropagationError(e)
+            && memberDomainRetries < MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS) {
+            //
+            // SECOP-1096: a just-provisioned group isn't resolvable by
+            // the org-policy member-domain checker yet. Back off longer
+            // than the 412 case (propagation is tens of seconds, not
+            // milliseconds) and retry. Don't spend a concurrency-control
+            // attempt on it — decrement so 412 retries stay available.
+            //
+            memberDomainRetries++;
+            try {
+              Thread.sleep(2000L << (memberDomainRetries - 1)); // 2s, 4s, 8s
+            }
+            catch (InterruptedException ignored) {
+            }
+            attempt--;
           }
           else {
             throw (GoogleJsonResponseException) e.fillInStackTrace();
