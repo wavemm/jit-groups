@@ -21,12 +21,14 @@ import com.google.solutions.jitaccess.catalog.JitGroupContext;
 import com.google.solutions.jitaccess.catalog.Proposal;
 import com.google.solutions.jitaccess.web.proposal.SlackMessageRegistry.ReviewerMessage;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.net.URI;
 import java.security.SecureRandom;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -685,6 +687,171 @@ public class SlackProposalHandler extends AbstractProposalHandler {
         proposalId, cause.getMessage());
     }
   }
+
+  /**
+   * Largest number of teammates we enrich with Slack availability
+   * before selecting (SECOP-1098). Bounds the extra Slack calls
+   * (lookup + presence + tz per candidate) to a shortlist; teammates
+   * past this stay in affinity order and only matter as backfill.
+   */
+  static final int AVAILABILITY_SHORTLIST_SIZE = 15;
+
+  /** Working-hours proximity window: same-ish timezone = within 2h. */
+  private static final int TZ_PROXIMITY_SECONDS = 2 * 60 * 60;
+
+  @Override
+  public @NotNull List<EndUserId> rankReviewersByAvailability(
+    @NotNull EndUserId requester,
+    @NotNull List<EndUserId> affinityRanked
+  ) {
+    if (affinityRanked.size() <= 1) {
+      return affinityRanked;
+    }
+
+    //
+    // Enrich only a bounded shortlist; the tail stays in affinity order
+    // and is appended unchanged (it only serves as backfill once the
+    // available candidates are exhausted).
+    //
+    var shortlist = affinityRanked.stream()
+      .limit(AVAILABILITY_SHORTLIST_SIZE)
+      .toList();
+    var tail = affinityRanked.stream()
+      .skip(AVAILABILITY_SHORTLIST_SIZE)
+      .toList();
+
+    try {
+      //
+      // SECOP-1104: enrich the shortlist CONCURRENTLY. Each candidate's
+      // (lookup → presence+tz) is an async chain; we fire them all and
+      // join once, so the cost is ~one round-trip pair rather than the
+      // ~3×15 strictly-sequential calls the first cut made on this
+      // already-slow POST path. The requester's tz is fetched in
+      // parallel too. Every chain degrades to "unknown" (tier 2) on its
+      // own error — a single bad candidate must not abort the ranking.
+      //
+      var requesterTzFuture = timezoneOffsetFuture(requester.email);
+      var futures = new HashMap<String, CompletableFuture<Availability>>();
+      for (var u : shortlist) {
+        futures.put(u.email, availabilityFuture(u.email));
+      }
+      var requesterTz = requesterTzFuture.join();
+      var byEmail = new HashMap<String, Availability>();
+      for (var e : futures.entrySet()) {
+        byEmail.put(e.getKey(), e.getValue().join());
+      }
+
+      //
+      // Stable sort: keep affinity order (the shortlist's existing
+      // order) except promote (0) currently-active teammates, then
+      // (1) those in a working-hours timezone near the requester's.
+      // Java's sort is stable, so affinity breaks ties within a tier.
+      //
+      var ranked = new ArrayList<>(shortlist);
+      ranked.sort(java.util.Comparator.comparingInt(
+        (EndUserId u) -> availabilityTier(byEmail.get(u.email), requesterTz)));
+
+      var result = new ArrayList<>(ranked);
+      result.addAll(tail);
+
+      //
+      // Log the tier distribution, not just "reordered N" — if the bot
+      // token lacks users:read every candidate silently lands in tier 2
+      // (ranking is a no-op) and this line makes that visible
+      // (active=0 tzNear=0) rather than falsely implying it worked.
+      //
+      var active = shortlist.stream()
+        .filter(u -> availabilityTier(byEmail.get(u.email), requesterTz) == 0).count();
+      var tzNear = shortlist.stream()
+        .filter(u -> availabilityTier(byEmail.get(u.email), requesterTz) == 1).count();
+      this.logger.info(
+        "slack.rankReviewersByAvailability",
+        "Reordered %d reviewer(s) availability-first for %s "
+          + "(active=%d tzNear=%d other=%d)",
+        shortlist.size(), requester.email,
+        active, tzNear, shortlist.size() - active - tzNear);
+      return result;
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.warn(
+        "slack.rankReviewersByAvailability.failed",
+        "Availability ranking failed for %s; falling back to affinity "
+          + "order (fail-open). cause=%s",
+        requester.email, cause.getMessage());
+      return affinityRanked;
+    }
+  }
+
+  /**
+   * Rank tier: 0 = active now (best), 1 = in a nearby working-hours
+   * timezone, 2 = everything else. Lower sorts first.
+   */
+  private int availabilityTier(Availability a, Integer requesterTz) {
+    if (a == null) {
+      return 2;
+    }
+    if (a.active()) {
+      return 0;
+    }
+    if (a.tzOffsetSeconds() != null && requesterTz != null) {
+      //
+      // SECOP-1104: compare offsets on a 24h circle. Raw |a-b| treats
+      // antimeridian neighbours (UTC+13 vs UTC-11 — identical local
+      // clocks) as ~24h apart; wrap so the smaller arc counts.
+      //
+      var diff = Math.abs(a.tzOffsetSeconds() - requesterTz);
+      var wrapped = Math.min(diff, 86400 - diff);
+      if (wrapped <= TZ_PROXIMITY_SECONDS) {
+        return 1;
+      }
+    }
+    return 2;
+  }
+
+  /**
+   * Async (active?, tzOffset) for one candidate. Self-contained
+   * degradation: any failure in the chain yields "unknown" (tier 2)
+   * rather than failing the whole ranking (SECOP-1104).
+   */
+  private @NotNull CompletableFuture<Availability> availabilityFuture(
+    @NotNull String email
+  ) {
+    return this.slackClient.lookupUserByEmail(email)
+      .thenCompose(userId -> {
+        if (userId == null) {
+          return CompletableFuture.completedFuture(new Availability(email, false, null));
+        }
+        return this.slackClient.isActive(userId)
+          .thenCombine(
+            this.slackClient.timezoneOffsetSeconds(userId),
+            (active, tz) -> new Availability(email, active, tz));
+      })
+      .exceptionally(ex -> {
+        var cause = ex.getCause() != null ? ex.getCause() : ex;
+        this.logger.warn(
+          "slack.availabilityLookup.failed",
+          "Availability lookup failed for %s; treating as unknown. cause=%s",
+          email, cause.getMessage());
+        return new Availability(email, false, null);
+      });
+  }
+
+  private @NotNull CompletableFuture<@Nullable Integer> timezoneOffsetFuture(
+    @NotNull String email
+  ) {
+    return this.slackClient.lookupUserByEmail(email)
+      .thenCompose(userId -> userId == null
+        ? CompletableFuture.completedFuture((Integer) null)
+        : this.slackClient.timezoneOffsetSeconds(userId))
+      .exceptionally(ex -> null);
+  }
+
+  private record Availability(
+    @NotNull String email,
+    boolean active,
+    @Nullable Integer tzOffsetSeconds
+  ) {}
 
   private void notifyBeneficiary(
     @NotNull String beneficiary,

@@ -382,6 +382,137 @@ public class TestSlackProposalHandler {
   // ---------------------------------------------------------------------
 
   // -------------------------------------------------------------------------
+  // Availability-first reviewer ranking (SECOP-1098).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void rankReviewersByAvailability_promotesActiveOverInactive() {
+    var slack = mock(SlackClient.class);
+    when(slack.lookupUserByEmail(eq("alice@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-ALICE"));
+    when(slack.lookupUserByEmail(eq("bob@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-BOB"));
+    when(slack.lookupUserByEmail(eq("carol@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-CAROL"));
+    // tz unknown for everyone → only presence differentiates.
+    when(slack.timezoneOffsetSeconds(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    when(slack.isActive(eq("U-BOB")))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    when(slack.isActive(eq("U-CAROL")))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    // Affinity order is [BOB, CAROL]; Carol is active → promoted first.
+    var ranked = handler.rankReviewersByAvailability(ALICE, List.of(BOB, CAROL));
+    assertEquals(List.of(CAROL, BOB), ranked);
+  }
+
+  @Test
+  public void rankReviewersByAvailability_breaksTiesByTimezoneProximity() {
+    var slack = mock(SlackClient.class);
+    when(slack.lookupUserByEmail(eq("alice@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-ALICE"));
+    when(slack.lookupUserByEmail(eq("bob@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-BOB"));
+    when(slack.lookupUserByEmail(eq("carol@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-CAROL"));
+    // Nobody active; requester at UTC. Bob +1h (near), Carol +10h (far).
+    when(slack.isActive(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    when(slack.timezoneOffsetSeconds(eq("U-ALICE")))
+      .thenReturn(CompletableFuture.completedFuture(0));
+    when(slack.timezoneOffsetSeconds(eq("U-BOB")))
+      .thenReturn(CompletableFuture.completedFuture(3600));
+    when(slack.timezoneOffsetSeconds(eq("U-CAROL")))
+      .thenReturn(CompletableFuture.completedFuture(36000));
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    // Affinity order [CAROL, BOB]; Bob's timezone is near the requester's
+    // → promoted over Carol despite Carol's higher affinity.
+    var ranked = handler.rankReviewersByAvailability(ALICE, List.of(CAROL, BOB));
+    assertEquals(List.of(BOB, CAROL), ranked);
+  }
+
+  @Test
+  public void rankReviewersByAvailability_failsOpenToAffinityOrder() {
+    var slack = mock(SlackClient.class);
+    when(slack.lookupUserByEmail(anyString()))
+      .thenReturn(CompletableFuture.failedFuture(new RuntimeException("slack down")));
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    var input = List.of(BOB, CAROL);
+    assertEquals(input, handler.rankReviewersByAvailability(ALICE, input));
+  }
+
+  @Test
+  public void rankReviewersByAvailability_singletonReturnedUnchanged() {
+    var slack = mock(SlackClient.class);
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    assertEquals(List.of(BOB), handler.rankReviewersByAvailability(ALICE, List.of(BOB)));
+    // No Slack calls for a trivial list.
+    verifyNoInteractions(slack);
+  }
+
+  /**
+   * SECOP-1104: timezone proximity wraps on the 24h circle — a teammate
+   * across the antimeridian (identical local clock) counts as close, not
+   * ~24h away.
+   */
+  @Test
+  public void rankReviewersByAvailability_treatsAntimeridianAsClose() {
+    var slack = mock(SlackClient.class);
+    when(slack.lookupUserByEmail(eq("alice@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-ALICE"));
+    when(slack.lookupUserByEmail(eq("bob@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-BOB"));
+    when(slack.lookupUserByEmail(eq("carol@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-CAROL"));
+    when(slack.isActive(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    when(slack.timezoneOffsetSeconds(eq("U-ALICE")))
+      .thenReturn(CompletableFuture.completedFuture(46800));   // UTC+13
+    when(slack.timezoneOffsetSeconds(eq("U-BOB")))
+      .thenReturn(CompletableFuture.completedFuture(-39600));  // UTC-11, same clock
+    when(slack.timezoneOffsetSeconds(eq("U-CAROL")))
+      .thenReturn(CompletableFuture.completedFuture(0));       // UTC, 13h away
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    // Affinity [CAROL, BOB]; Bob wraps to 0h from Alice → tier 1, Carol
+    // 13h away → tier 2 → Bob promoted.
+    var ranked = handler.rankReviewersByAvailability(ALICE, List.of(CAROL, BOB));
+    assertEquals(List.of(BOB, CAROL), ranked);
+  }
+
+  /**
+   * SECOP-1104: a single candidate's enrichment failure degrades only
+   * that candidate (to tier 2) — it must NOT abort ranking for everyone
+   * (which would revert to pure affinity order).
+   */
+  @Test
+  public void rankReviewersByAvailability_degradesFailedCandidateNotWholesale() {
+    var slack = mock(SlackClient.class);
+    when(slack.lookupUserByEmail(eq("alice@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-ALICE"));
+    when(slack.timezoneOffsetSeconds(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    // Bob's lookup fails; Carol is active.
+    when(slack.lookupUserByEmail(eq("bob@example.com")))
+      .thenReturn(CompletableFuture.failedFuture(new RuntimeException("boom")));
+    when(slack.lookupUserByEmail(eq("carol@example.com")))
+      .thenReturn(CompletableFuture.completedFuture("U-CAROL"));
+    when(slack.isActive(eq("U-CAROL")))
+      .thenReturn(CompletableFuture.completedFuture(true));
+    var handler = newHandler(slack, registryHappyPath(), groupResolverPassthrough());
+
+    // Affinity [BOB, CAROL]; Bob degrades to tier 2, Carol active → tier 0.
+    // Result [CAROL, BOB]; a wholesale fail-open would have kept [BOB, CAROL].
+    var ranked = handler.rankReviewersByAvailability(ALICE, List.of(BOB, CAROL));
+    assertEquals(List.of(CAROL, BOB), ranked);
+  }
+
+  // -------------------------------------------------------------------------
   // Duplicate-proposal skip (SECOP-1097).
   // -------------------------------------------------------------------------
 
