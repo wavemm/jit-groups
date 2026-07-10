@@ -45,11 +45,14 @@ public abstract class AbstractIamClient {
    * Bounded retries for the "member not in permitted organization"
    * propagation race (SECOP-1096). Separate budget from the
    * concurrency-control attempts so a slow propagation can't starve
-   * 412 handling. 3 attempts at 2s/4s/8s ≈ 14s covers the lag observed
-   * in production (a newly-created JIT group took ~15–26s to become
-   * resolvable by the org-policy member-domain checker).
+   * 412 handling. 4 attempts at 2s/4s/8s/16s ≈ 30s (SECOP-1102, up from
+   * 3/14s) covers the full lag observed in production — a newly-created
+   * JIT group took ~15–26s to become resolvable by the org-policy
+   * member-domain checker, and the old 14s budget failed the upper half
+   * of that range. This path only runs on the first-ever join of a new
+   * org-scoped role, so the rare worst-case wait is acceptable.
    */
-  private static final int MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS = 3;
+  private static final int MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS = 4;
 
   private static boolean isRoleNotGrantableErrorMessage(@Nullable String message)
   {
@@ -196,8 +199,25 @@ public abstract class AbstractIamClient {
             catch (InterruptedException ignored) {
             }
           }
-          else if (isMemberDomainPropagationError(e)
-            && memberDomainRetries < MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS) {
+          else if (isMemberDomainPropagationError(e)) {
+            if (memberDomainRetries >= MAX_MEMBER_DOMAIN_PROPAGATION_ATTEMPTS) {
+              //
+              // SECOP-1102: retries exhausted. After ~30s the membership
+              // still isn't resolvable, so this is almost certainly a
+              // genuine domain-restriction denial rather than propagation
+              // lag. Surface it honestly — the pre-existing outer
+              // 400->401 fallthrough would mislabel it
+              // NotAuthenticatedException("Not authenticated"), sending
+              // operators to debug auth/OAuth instead of the org policy.
+              //
+              throw new AccessDeniedException(String.format(
+                "Modifying the IAM policy of '%s' was denied by the "
+                  + "iam.allowedPolicyMemberDomains org policy: a bound "
+                  + "principal is outside the permitted organization "
+                  + "domains. (If this is a newly-created group, its "
+                  + "membership had not propagated after ~30s of retries.)",
+                fullResourcePath), e);
+            }
             //
             // SECOP-1096: a just-provisioned group isn't resolvable by
             // the org-policy member-domain checker yet. Back off longer
@@ -207,7 +227,7 @@ public abstract class AbstractIamClient {
             //
             memberDomainRetries++;
             try {
-              Thread.sleep(2000L << (memberDomainRetries - 1)); // 2s, 4s, 8s
+              Thread.sleep(2000L << (memberDomainRetries - 1)); // 2s, 4s, 8s, 16s
             }
             catch (InterruptedException ignored) {
             }

@@ -104,8 +104,9 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
     @NotNull ProposeOptions options
   ) throws AccessException {
 
+    var expiry = Instant.now().plus(this.options.tokenExpiry);
     var proposal = joinOperation.propose(
-      Instant.now().plus(this.options.tokenExpiry),
+      expiry,
       options.reviewerFilter());
 
     Preconditions.checkArgument(
@@ -114,6 +115,27 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
     Preconditions.checkArgument(
       !proposal.recipients().contains(proposal.user()),
       "Recipients must not contain the requesting user");
+
+    //
+    // SECOP-1101: reject duplicate in-flight requests BEFORE minting a
+    // token. Atomically reserve a pending marker; if one already exists
+    // (and hasn't expired), this is a re-submit of a request whose
+    // reviewers were already notified — throw rather than mint a second
+    // approvable token and fan out a second DM batch. Copy-link
+    // (notifyReviewers=false) is exempt: it sends no DMs and each call
+    // legitimately wants its own link. The reservation is released below
+    // if minting/notification fails, so a genuine retry isn't locked out.
+    //
+    boolean reserved = false;
+    if (options.notifyReviewers()) {
+      if (!reserveProposal(proposal, options.reviewersAutoSelected(), expiry)) {
+        throw new AccessDeniedException(
+          "You already have a pending approval request for this group. "
+            + "Wait for a reviewer to act on it, or for it to expire, "
+            + "before submitting another.");
+      }
+      reserved = true;
+    }
 
     //
     // Encode all inputs into a token and sign it.
@@ -173,10 +195,49 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
 
       return proposalToken;
     }
-    catch (AccessException | IOException e) {
+    catch (AccessException | IOException | RuntimeException e) {
+      // SECOP-1101: minting/notification failed after we reserved —
+      // release the pending marker so a legitimate retry isn't blocked
+      // for the token lifetime.
+      if (reserved) {
+        releaseProposalReservation(proposal, options.reviewersAutoSelected());
+      }
+      if (e instanceof RuntimeException runtime) {
+        throw runtime;
+      }
       throw new AccessDeniedException(
         "Creating a proposal failed", e);
     }
+  }
+
+  /**
+   * Wavemm fork (SECOP-1101): atomically reserve a pending-request
+   * marker before a token is minted, returning {@code false} if a live
+   * (non-expired) reservation already exists — i.e. this is a duplicate
+   * submit. Default no-op returning {@code true} (mail/debug don't
+   * dedupe). The key an implementation uses MUST be stable across the
+   * retries a requester makes: keyed on (beneficiary, group) when the
+   * reviewers were auto-selected (the picked set can shift between
+   * submits), and on (beneficiary, group, recipients) when the
+   * requester picked reviewers explicitly.
+   */
+  boolean reserveProposal(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected,
+    @NotNull Instant expiry
+  ) throws AccessException {
+    return true;
+  }
+
+  /**
+   * Wavemm fork (SECOP-1101): release a reservation taken by
+   * {@link #reserveProposal} when the propose failed after reserving.
+   * Best-effort; default no-op.
+   */
+  void releaseProposalReservation(
+    @NotNull Proposal proposal,
+    boolean reviewersAutoSelected
+  ) {
   }
 
   @SuppressWarnings("unchecked")

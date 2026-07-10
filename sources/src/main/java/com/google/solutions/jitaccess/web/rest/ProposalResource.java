@@ -131,14 +131,6 @@ public class ProposalResource {
         groupId.environment().equals(environment),
         "The token must match the environment");
 
-      // SECOP-1093: proposal tokens approve exactly once. The check
-      // runs BEFORE the approval executes; the marker is written right
-      // after it succeeds.
-      this.proposalHandler.verifyNotConsumed(proposal);
-
-      //
-      // Attempt to approve.
-      //
       var group = this.catalog
         .group(proposal.group())
         .orElseThrow(() -> NOT_FOUND);
@@ -146,9 +138,25 @@ public class ProposalResource {
       var approveOp = group.approve(proposal);
       Inputs.copyValues(inputValues, approveOp.input());
 
-      var principal = approveOp.execute();
+      //
+      // SECOP-1100: proposal tokens approve exactly once. Atomically
+      // claim the token immediately BEFORE executing — a concurrent
+      // second click loses the claim and is rejected here rather than
+      // executing a duplicate grant. If the execute fails before
+      // granting, release the claim so a legitimate retry works. (The
+      // GET path uses verifyNotConsumed for a friendly banner; the
+      // claim here is the actual gate.)
+      //
+      this.proposalHandler.claimForApproval(proposal);
+      Principal principal;
+      try {
+        principal = approveOp.execute();
+      }
+      catch (Exception e) {
+        this.proposalHandler.releaseClaim(proposal);
+        throw e;
+      }
       this.auditTrail.joinExecuted(approveOp, principal);
-      this.proposalHandler.markConsumed(proposal);
 
       return ProposalInfo.create(
         group,
