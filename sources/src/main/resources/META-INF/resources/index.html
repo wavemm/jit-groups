@@ -760,8 +760,9 @@
                             <span class="jit-reviewer-picker-hint">
                                 — pick one or more teammates (those tagged
                                 <strong>team</strong> are likely on yours).
-                                Leave all unchecked to notify your closest
-                                qualified teammates automatically.
+                                Leave all unchecked and we'll pick close
+                                teammates for you — or, on small teams,
+                                notify every qualified approver.
                             </span>
                         </div>
                         <input type="search"
@@ -977,17 +978,21 @@
                     });
                 }
                 else if (groupInfo.join.status == 'JOIN_PROPOSED') {
-                    // SECOP-1099: name the notified reviewers, and when the
-                    // set was auto-picked, teach the picker.
+                    // SECOP-1099: name the reviewers this request was sent
+                    // to, and when the set was auto-picked, teach the picker.
+                    // SECOP-1103: phrase as "requested" not "delivered" —
+                    // this list is who we asked; a reviewer who isn't in
+                    // Slack simply won't get a DM, and the Slack DM is the
+                    // delivery-accurate surface.
                     let secondary = undefined;
                     if (groupInfo.join.notifiedReviewers &&
                         groupInfo.join.notifiedReviewers.length > 0) {
                         secondary = groupInfo.join.reviewersAutoSelected
-                            ? "Sent to what we think are your closest teammates " +
+                            ? "We asked what we think are your closest teammates " +
                               "(since you didn't pick anyone specifically): " +
                               groupInfo.join.notifiedReviewers.join(", ") +
                               " — next time you can choose reviewers with the picker above."
-                            : "Sent to: " + groupInfo.join.notifiedReviewers.join(", ");
+                            : "Reviewers requested: " + groupInfo.join.notifiedReviewers.join(", ");
                     }
                     this.membership.addRow({
                         primary: "Your request to join the group was sent for approval",
