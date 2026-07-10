@@ -19,6 +19,8 @@ import com.slack.api.methods.SlackApiException;
 import com.slack.api.methods.response.chat.ChatPostMessageResponse;
 import com.slack.api.methods.response.chat.ChatUpdateResponse;
 import com.slack.api.methods.response.conversations.ConversationsOpenResponse;
+import com.slack.api.methods.response.users.UsersGetPresenceResponse;
+import com.slack.api.methods.response.users.UsersInfoResponse;
 import com.slack.api.methods.response.users.UsersLookupByEmailResponse;
 import com.slack.api.model.block.LayoutBlock;
 import org.jetbrains.annotations.NotNull;
@@ -142,6 +144,51 @@ public class SlackClient {
       catch (SlackApiException e) {
         throw new IOException(
           "Slack API error updating message " + channelId + "/" + messageTs, e);
+      }
+    }, this.executor);
+  }
+
+  /**
+   * Whether a user is currently active on Slack (SECOP-1098). "active"
+   * vs "away" is a coarse signal (desktop idle reads as away), so
+   * callers use it to prioritise, never to exclude. Returns false when
+   * presence can't be determined — a conservative default that just
+   * means "don't prioritise", not "unavailable".
+   */
+  public @NotNull CompletableFuture<Boolean> isActive(
+    @NotNull String slackUserId
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      try {
+        UsersGetPresenceResponse response =
+          this.methods.usersGetPresence(req -> req.user(slackUserId));
+        return response.isOk() && "active".equals(response.getPresence());
+      }
+      catch (SlackApiException e) {
+        throw new IOException("Slack API error in users.getPresence for " + slackUserId, e);
+      }
+    }, this.executor);
+  }
+
+  /**
+   * The user's timezone offset from UTC in seconds (SECOP-1098), or null
+   * when unknown. Used to prefer reviewers in working hours close to the
+   * requester's.
+   */
+  public @NotNull CompletableFuture<@Nullable Integer> timezoneOffsetSeconds(
+    @NotNull String slackUserId
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      try {
+        UsersInfoResponse response =
+          this.methods.usersInfo(req -> req.user(slackUserId));
+        if (!response.isOk() || response.getUser() == null) {
+          return null;
+        }
+        return response.getUser().getTzOffset();
+      }
+      catch (SlackApiException e) {
+        throw new IOException("Slack API error in users.info for " + slackUserId, e);
       }
     }, this.executor);
   }

@@ -31,6 +31,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.net.URI;
 import java.time.Instant;
+import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -105,6 +106,30 @@ public interface ProposalHandler {
   @NotNull Proposal accept(
     @NotNull String proposalToken
   ) throws AccessException;
+
+  /**
+   * Wavemm fork (SECOP-1098): reorder an affinity-ranked list of
+   * candidate reviewers to prefer those most likely to act quickly —
+   * currently-active-on-Slack first, then in a working-hours timezone
+   * close to the requester's — so an empty-selection auto-pick lands on
+   * reviewers who can approve soon rather than ones who are asleep.
+   *
+   * <p>The default is a no-op passthrough: handlers without a presence
+   * signal (mail, debug) keep the pure-affinity order. The Slack handler
+   * overrides this. Availability is a *tiebreaker*, never a filter — an
+   * offline teammate is deprioritised, not dropped, and any enrichment
+   * failure falls back to the input order (fail-open).
+   *
+   * @param requester       the user whose request needs reviewers
+   * @param affinityRanked  candidate reviewer emails, closest-first
+   * @return the same emails, reordered availability-first
+   */
+  default @NotNull List<EndUserId> rankReviewersByAvailability(
+    @NotNull EndUserId requester,
+    @NotNull List<EndUserId> affinityRanked
+  ) {
+    return affinityRanked;
+  }
 
   /**
    * Wavemm fork (SECOP-1093): read-only check that a proposal token

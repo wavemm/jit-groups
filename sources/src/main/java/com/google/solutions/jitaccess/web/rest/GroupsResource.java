@@ -576,20 +576,30 @@ public class GroupsResource {
 
     //
     // Teammates = candidates sharing at least one small group with the
-    // requester, in affinity order (compute() ranks them score-first),
-    // capped at the requester's AUTO_NARROW_TEAMMATE_CAP closest. NOT
-    // the `suggested` badge (a presentation cap), and deliberately a
-    // few rather than one — a couple of OOO or offboarded teammates
-    // must not strand the request.
+    // requester, in affinity order (compute() ranks them score-first).
+    // NOT the `suggested` badge (a presentation cap).
     //
-    var teammates = candidates.stream()
+    var teammatesByAffinity = candidates.stream()
       .filter(ReviewerCandidates.Candidate::teammate)
-      .limit(AUTO_NARROW_TEAMMATE_CAP)
       .map(c -> new EndUserId(c.email()))
-      .collect(Collectors.toSet());
+      .toList();
 
-    if (!teammates.isEmpty()) {
-      return teammates;
+    if (!teammatesByAffinity.isEmpty()) {
+      //
+      // SECOP-1098: reorder availability-first (active-on-Slack, then
+      // working-hours-timezone-close) so the auto-pick lands on
+      // reviewers who can approve soonest — the whole point of picking
+      // is to shorten the requester's wait. No-op passthrough for
+      // non-Slack handlers, and fail-open. Then cap at the requester's
+      // AUTO_NARROW_TEAMMATE_CAP closest/soonest — deliberately a few
+      // rather than one, so a couple of OOO teammates don't strand the
+      // request.
+      //
+      var ranked = this.proposalHandler.rankReviewersByAvailability(
+        requester, teammatesByAffinity);
+      return ranked.stream()
+        .limit(AUTO_NARROW_TEAMMATE_CAP)
+        .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
     }
 
     //
