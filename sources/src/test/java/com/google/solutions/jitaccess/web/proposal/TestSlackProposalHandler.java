@@ -558,12 +558,16 @@ public class TestSlackProposalHandler {
     handler.verifyNotConsumed(proposal);  // must not throw
   }
 
+  /**
+   * SECOP-1100: claimForApproval writes an atomic claim with the token
+   * expiry and returns normally when this caller wins the create.
+   */
   @Test
-  public void markConsumed_writesMarkerWithTokenExpiry() {
+  public void claimForApproval_claimsWithTokenExpiry() throws Exception {
     var registry = mock(SlackMessageRegistry.class);
     when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
-    when(registry.markProposalConsumed(anyString(), any()))
-      .thenReturn(CompletableFuture.completedFuture(null));
+    when(registry.claimProposalConsumption(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(true));
     var handler = newHandler(
       slackClientHappyPath(), registry, groupResolverPassthrough());
 
@@ -572,16 +576,60 @@ public class TestSlackProposalHandler {
     when(proposal.id()).thenReturn("jti-1");
     when(proposal.expiry()).thenReturn(expiry);
 
-    handler.markConsumed(proposal);
+    handler.claimForApproval(proposal);  // must not throw when it wins
 
-    verify(registry).markProposalConsumed(eq("consumption-key"), eq(expiry));
+    verify(registry).claimProposalConsumption(eq("consumption-key"), eq(expiry));
+  }
+
+  /**
+   * SECOP-1100: losing the atomic claim (create returned false → someone
+   * else is approving / already approved) is a hard reject.
+   */
+  @Test
+  public void claimForApproval_rejectsWhenClaimLost() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.claimProposalConsumption(anyString(), any()))
+      .thenReturn(CompletableFuture.completedFuture(false));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+    when(proposal.expiry()).thenReturn(Instant.now().plus(Duration.ofHours(1)));
+
+    assertThrows(
+      AccessDeniedException.class,
+      () -> handler.claimForApproval(proposal));
+  }
+
+  /**
+   * SECOP-1100: a Firestore error during the claim fails open — an
+   * approval must not hard-depend on Firestore (replay protection
+   * degrades, logged loud). Must not throw.
+   */
+  @Test
+  public void claimForApproval_failsOpenOnRegistryError() throws Exception {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
+    when(registry.claimProposalConsumption(anyString(), any()))
+      .thenReturn(CompletableFuture.failedFuture(
+        new RuntimeException("firestore unavailable")));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    when(proposal.id()).thenReturn("jti-1");
+    when(proposal.expiry()).thenReturn(Instant.now().plus(Duration.ofHours(1)));
+
+    handler.claimForApproval(proposal);  // fail-open: no throw
   }
 
   @Test
-  public void markConsumed_swallowsRegistryErrors() {
+  public void releaseClaim_deletesMarkerAndSwallowsErrors() {
     var registry = mock(SlackMessageRegistry.class);
-    when(registry.consumptionKey(anyString())).thenReturn("consumption-key");
-    when(registry.markProposalConsumed(anyString(), any()))
+    when(registry.consumptionKey(eq("jti-1"))).thenReturn("consumption-key");
+    when(registry.releaseProposalConsumption(anyString()))
       .thenReturn(CompletableFuture.failedFuture(
         new RuntimeException("firestore unavailable")));
     var handler = newHandler(
@@ -590,7 +638,8 @@ public class TestSlackProposalHandler {
     var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
     when(proposal.id()).thenReturn("jti-1");
 
-    handler.markConsumed(proposal);  // must not throw
+    handler.releaseClaim(proposal);  // must not throw
+    verify(registry).releaseProposalConsumption(eq("consumption-key"));
   }
 
   @Test

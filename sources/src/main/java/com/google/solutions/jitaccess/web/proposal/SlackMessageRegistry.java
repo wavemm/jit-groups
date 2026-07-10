@@ -259,13 +259,23 @@ public class SlackMessageRegistry {
   }
 
   /**
-   * Record that a proposal was used to approve (SECOP-1093). The marker
-   * lives in the same collection as request entries so the existing
-   * Firestore TTL policy on {@value #FIELD_EXPIRES_AT} reaps it — the
-   * expiry passed here must be the token expiry, since a marker is only
+   * Atomically claim a proposal for approval (SECOP-1100). Uses
+   * Firestore {@code create()}, which fails if the document already
+   * exists, so exactly one concurrent caller wins the claim — the
+   * primitive that makes "approve exactly once" hold under simultaneous
+   * approver clicks, unlike the previous upsert {@code set()} where the
+   * second writer silently overwrote the first.
+   *
+   * <p>The marker lives in the same collection as request entries so the
+   * existing Firestore TTL on {@value #FIELD_EXPIRES_AT} reaps it —
+   * {@code expiresAt} must be the token expiry, since the claim is only
    * meaningful while the token it blocks is still valid.
+   *
+   * @return {@code true} if this caller created the claim, {@code false}
+   *         if it already existed (someone else is approving / has
+   *         approved this token)
    */
-  public @NotNull CompletableFuture<Void> markProposalConsumed(
+  public @NotNull CompletableFuture<Boolean> claimProposalConsumption(
     @NotNull String consumptionKey,
     @NotNull Instant expiresAt
   ) {
@@ -276,15 +286,58 @@ public class SlackMessageRegistry {
         expiresAt.getNano()));
       doc.put(FIELD_CONSUMED, true);
       try {
-        collection().document(consumptionKey).set(doc).get();
+        collection().document(consumptionKey).create(doc).get();
+        return true;
       }
-      catch (InterruptedException | ExecutionException e) {
+      catch (ExecutionException e) {
+        if (isAlreadyExists(e.getCause())) {
+          return false;
+        }
+        throw new RuntimeException(
+          "Failed to claim proposal consumption marker " + consumptionKey, e);
+      }
+      catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         throw new RuntimeException(
-          "Failed to write proposal consumption marker " + consumptionKey, e);
+          "Interrupted claiming proposal consumption marker " + consumptionKey, e);
+      }
+    }, this.executor);
+  }
+
+  /**
+   * Release a previously-claimed proposal (SECOP-1100), so a legitimate
+   * retry can approve after the claimed attempt failed before granting.
+   * Best-effort: if the delete fails the claim stays and the token is
+   * burned — the fail-safe direction (deny replay over permit it).
+   */
+  public @NotNull CompletableFuture<Void> releaseProposalConsumption(
+    @NotNull String consumptionKey
+  ) {
+    return CompletableFutures.supplyAsync(() -> {
+      try {
+        collection().document(consumptionKey).delete().get();
+      }
+      catch (ExecutionException e) {
+        this.logger.warn(
+          "slackRegistry.releaseClaim.failed",
+          "Failed to release consumption claim %s; the token stays "
+            + "burned until TTL reaps it: %s",
+          consumptionKey, e.getMessage());
+      }
+      catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
       }
       return null;
     }, this.executor);
+  }
+
+  private static boolean isAlreadyExists(java.lang.Throwable cause) {
+    if (cause instanceof com.google.api.gax.rpc.AlreadyExistsException) {
+      return true;
+    }
+    return cause != null
+      && cause.getMessage() != null
+      && cause.getMessage().toUpperCase().contains("ALREADY_EXISTS");
   }
 
   /**

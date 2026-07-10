@@ -438,6 +438,30 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     @NotNull JitGroupContext.ApprovalOperation operation,
     @NotNull Proposal proposal
   ) throws AccessException, IOException {
+    //
+    // SECOP-1100: this hook runs INSIDE ApprovalOperation.execute(),
+    // AFTER the membership has been granted. Anything thrown here would
+    // propagate out of execute() as a 500 even though access is already
+    // live — and, worse, would skip the caller's markConsumed/audit,
+    // leaving the token replayable. Notification is strictly
+    // post-completion best-effort: swallow everything, log loud.
+    //
+    try {
+      notifyProposalApproved(operation, proposal);
+    }
+    catch (Exception e) {
+      this.logger.error(
+        "slack.onProposalApproved.failed",
+        "Post-approval Slack notification failed for group=%s approver=%s; "
+          + "the approval itself succeeded and is unaffected. cause=%s",
+        proposal.group(), operation.user().email, e.getMessage());
+    }
+  }
+
+  private void notifyProposalApproved(
+    @NotNull JitGroupContext.ApprovalOperation operation,
+    @NotNull Proposal proposal
+  ) throws AccessException, IOException {
     var fp = fingerprint(proposal);
     var approverEmail = operation.user().email;
 
@@ -558,20 +582,25 @@ public class SlackProposalHandler extends AbstractProposalHandler {
   }
 
   /**
-   * SECOP-1093: record consumption after a successful approval.
-   * Best-effort by contract — the approval already succeeded, so a
-   * failed write only restores replayability for this one token; log
-   * loud and move on.
+   * SECOP-1100: atomically claim the token before the approval executes.
+   * The Firestore {@code create()} is the concurrency gate — if two
+   * approvers click the same link at once, exactly one create succeeds
+   * and the other is rejected here, before either grants. Fail-open on
+   * infrastructure errors (availability over replay-protection, same
+   * tradeoff as the SECOP-1093 read), but an explicit already-claimed
+   * result is a hard reject.
    */
   @Override
-  public void markConsumed(@NotNull Proposal proposal) {
+  public void claimForApproval(@NotNull Proposal proposal)
+    throws AccessException {
     var proposalId = proposal.id();
     if (proposalId == null) {
       return;
     }
+    boolean claimed;
     try {
-      this.registry
-        .markProposalConsumed(
+      claimed = this.registry
+        .claimProposalConsumption(
           this.registry.consumptionKey(proposalId),
           proposal.expiry())
         .join();
@@ -579,10 +608,43 @@ public class SlackProposalHandler extends AbstractProposalHandler {
     catch (RuntimeException e) {
       var cause = e.getCause() != null ? e.getCause() : e;
       this.logger.error(
-        "slack.consumption.markFailed",
-        "Failed to record proposal consumption for id=%s; this token "
-          + "remains replayable until it expires at %s. cause=%s",
-        proposalId, proposal.expiry(), cause.getMessage());
+        "slack.consumption.claimFailed",
+        "Failed to claim proposal for id=%s; allowing the approval "
+          + "(fail-open) — replay protection degraded until Firestore "
+          + "recovers. cause=%s",
+        proposalId, cause.getMessage());
+      return;
+    }
+    if (!claimed) {
+      throw new AccessDeniedException(
+        "This approval link has already been used. If further access is "
+          + "needed, ask the requester to submit a new request.");
+    }
+  }
+
+  /**
+   * SECOP-1100: release a claim when the approval didn't complete, so a
+   * legitimate retry can approve. Best-effort — a failed release leaves
+   * the token burned (fail-safe).
+   */
+  @Override
+  public void releaseClaim(@NotNull Proposal proposal) {
+    var proposalId = proposal.id();
+    if (proposalId == null) {
+      return;
+    }
+    try {
+      this.registry
+        .releaseProposalConsumption(this.registry.consumptionKey(proposalId))
+        .join();
+    }
+    catch (RuntimeException e) {
+      var cause = e.getCause() != null ? e.getCause() : e;
+      this.logger.warn(
+        "slack.consumption.releaseFailed",
+        "Failed to release claim for id=%s; token stays burned until "
+          + "TTL. cause=%s",
+        proposalId, cause.getMessage());
     }
   }
 
