@@ -22,6 +22,7 @@
 package com.google.solutions.jitaccess.web.proposal;
 
 import com.google.api.client.json.GenericJson;
+import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.client.json.webtoken.JsonWebToken;
 import com.google.auth.oauth2.TokenVerifier;
 import com.google.common.base.Preconditions;
@@ -37,6 +38,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -231,8 +233,11 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
 
   /**
    * Wavemm fork (SECOP-1101): release a reservation taken by
-   * {@link #reserveProposal} when the propose failed after reserving.
-   * Best-effort; default no-op.
+   * {@link #reserveProposal} — either because the propose failed after
+   * reserving, or because the proposal was approved and the request is
+   * no longer pending. Best-effort; default no-op. Implementations must
+   * tolerate keys that were never reserved (approval releases both key
+   * variants because the variant isn't recoverable from the token).
    */
   void releaseProposalReservation(
     @NotNull Proposal proposal,
@@ -251,6 +256,22 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
       payload = this.tokenSigner.verify(proposalToken);
     }
     catch (TokenVerifier.VerificationException e) {
+      //
+      // Wavemm fork: expiry is the common verification failure
+      // (a reviewer clicking an approval link hours after it was
+      // minted) and deserves an actionable message. isProbablyExpired
+      // parses the payload without verifying the signature, so it may
+      // only ever pick the error message — both paths deny access.
+      //
+      if (isProbablyExpired(proposalToken)) {
+        throw new AccessDeniedException(
+          String.format(
+            "This approval link has expired: links can only be approved "
+              + "within %s of the request being made. Ask the requester "
+              + "to submit a new request.",
+            formatApproximateDuration(this.options.tokenExpiry)),
+          e);
+      }
       throw new AccessDeniedException("The proposal token is invalid", e);
     }
 
@@ -321,9 +342,65 @@ public abstract class AbstractProposalHandler implements ProposalHandler {
       public void onCompleted(
         @NotNull JitGroupContext.ApprovalOperation op
       ) throws AccessException, IOException {
+        //
+        // The approval executed, so this request is no longer pending:
+        // release the duplicate-submit reservation (SECOP-1101) so the
+        // user can request the same group again without waiting for
+        // this token to expire — with APPROVAL_TIMEOUT well above the
+        // elevation duration, same-day re-requests are routine. The
+        // token doesn't record which key variant propose() reserved
+        // (auto-selected vs hand-picked reviewers), so release both;
+        // releases are idempotent and best-effort.
+        //
+        releaseProposalReservation(this, true);
+        releaseProposalReservation(this, false);
         onProposalApproved(op, this);
       }
     };
+  }
+
+  /**
+   * Best-effort check whether a token that failed verification is a
+   * well-formed JWT whose expiry has passed. The payload is parsed
+   * WITHOUT verifying the signature, so the result may only be used to
+   * choose an error message, never to authorize.
+   */
+  private static boolean isProbablyExpired(@NotNull String jwt) {
+    try {
+      var parts = jwt.split("\\.");
+      if (parts.length != 3) {
+        return false;
+      }
+
+      var payloadJson = new String(
+        Base64.getUrlDecoder().decode(parts[1]),
+        StandardCharsets.UTF_8);
+      try (var parser = new GsonFactory().createJsonParser(payloadJson)) {
+        var expiry = parser
+          .parse(JsonWebToken.Payload.class)
+          .getExpirationTimeSeconds();
+        return expiry != null && Instant.now().getEpochSecond() > expiry;
+      }
+    }
+    catch (Exception e) {
+      return false;
+    }
+  }
+
+  private static @NotNull String formatApproximateDuration(
+    @NotNull Duration duration
+  ) {
+    var minutes = duration.toMinutes();
+    if (minutes == 0) {
+      return duration.toSeconds() + " seconds";
+    }
+    else if (minutes % 60 == 0) {
+      var hours = minutes / 60;
+      return hours == 1 ? "1 hour" : hours + " hours";
+    }
+    else {
+      return minutes == 1 ? "1 minute" : minutes + " minutes";
+    }
   }
 
   static class Claims {
