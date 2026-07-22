@@ -24,6 +24,7 @@ package com.google.solutions.jitaccess.web;
 import com.google.solutions.jitaccess.apis.CustomerId;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -179,5 +180,48 @@ public class TestApplicationConfiguration {
     assertEquals("1", configuration.smtpExtraOptionsMap().get("a"));
     assertEquals("2", configuration.smtpExtraOptionsMap().get("b"));
 
+  }
+
+  // -------------------------------------------------------------------------
+  // publicBaseUrl (wavemm fork).
+  // -------------------------------------------------------------------------
+
+  @Test
+  public void publicBaseUrl_whenNotSet() {
+    var configuration = new ApplicationConfiguration(createMandatorySettings());
+
+    assertFalse(configuration.publicBaseUrl.isPresent());
+  }
+
+  @Test
+  public void publicBaseUrl_whenSet() {
+    var settings = new HashMap<>(createMandatorySettings());
+    settings.put("PUBLIC_BASE_URL", " https://pam.example.com ");
+
+    var configuration = new ApplicationConfiguration(settings);
+
+    assertEquals(
+      URI.create("https://pam.example.com"),
+      configuration.publicBaseUrl.get());
+  }
+
+  @Test
+  public void publicBaseUrl_whenSchemeNotHttp_thenThrows() {
+    var settings = new HashMap<>(createMandatorySettings());
+    settings.put("PUBLIC_BASE_URL", "ftp://pam.example.com");
+
+    assertThrows(
+      IllegalStateException.class,
+      () -> new ApplicationConfiguration(settings));
+  }
+
+  @Test
+  public void publicBaseUrl_whenNotAbsolute_thenThrows() {
+    var settings = new HashMap<>(createMandatorySettings());
+    settings.put("PUBLIC_BASE_URL", "pam.example.com");
+
+    assertThrows(
+      IllegalStateException.class,
+      () -> new ApplicationConfiguration(settings));
   }
 }

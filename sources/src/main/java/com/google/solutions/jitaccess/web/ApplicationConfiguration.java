@@ -26,6 +26,8 @@ import com.google.solutions.jitaccess.apis.Domain;
 import com.google.solutions.jitaccess.apis.OrganizationId;
 import org.jetbrains.annotations.NotNull;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -221,6 +223,17 @@ public class ApplicationConfiguration extends AbstractConfiguration {
    */
   final boolean slackCopyLinkEnabled;
 
+  /**
+   * Canonical base URL for generated links, e.g. the approval links
+   * fanned out to reviewers (wavemm fork). When set, links built from
+   * requests that arrived on the app's default appspot host are
+   * rewritten to this URL. Versioned (…-dot-…) staging hosts, custom
+   * domains, and localhost are never rewritten — see
+   * {@link CanonicalLinkBuilder}. Optional; when unset, links inherit
+   * the requesting user's host (upstream behaviour).
+   */
+  final @NotNull Optional<URI> publicBaseUrl;
+
   public ApplicationConfiguration(@NotNull Map<String, String> settingsData) {
     super(settingsData);
 
@@ -352,6 +365,24 @@ public class ApplicationConfiguration extends AbstractConfiguration {
     this.slackCopyLinkEnabled = readSetting(
       Boolean::parseBoolean, "SLACK_COPY_LINK_ENABLED")
       .orElse(false);
+    this.publicBaseUrl = readStringSetting("PUBLIC_BASE_URL")
+      .map(url -> {
+        try {
+          var uri = new URI(url);
+          if (uri.getHost() == null ||
+            !("https".equalsIgnoreCase(uri.getScheme()) ||
+              "http".equalsIgnoreCase(uri.getScheme()))) {
+            throw new URISyntaxException(url, "not an absolute http(s) URL");
+          }
+          return uri;
+        }
+        catch (URISyntaxException e) {
+          throw new IllegalStateException(
+            "The environment variable 'PUBLIC_BASE_URL' must contain an " +
+              "absolute http(s) URL",
+            e);
+        }
+      });
   }
 
   public boolean isSmtpConfigured() {
