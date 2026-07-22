@@ -37,8 +37,11 @@ import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -256,6 +259,112 @@ public class TestAbstractProposalHandler {
     assertFalse(proposal.input().isEmpty());
     assertEquals(1, proposal.input().size());
     assertEquals("value1", proposal.input().get("prop1"));
+  }
+
+  /**
+   * Expired links get an actionable message instead of the generic
+   * "invalid" one. The expiry check parses the payload without
+   * verifying the signature (it only selects the message), so it must
+   * work on a token whose verification failed.
+   */
+  @Test
+  public void accept_whenTokenExpired_thenThrowsWithExpiryMessage() throws Exception {
+    var signer = Mockito.mock(TokenSigner.class);
+    when(signer.verify(anyString()))
+      .thenThrow(new TokenVerifier.VerificationException("Token is expired"));
+
+    var expiredJwt = String.join(
+      ".",
+      base64UrlEncode("{\"alg\":\"RS256\",\"typ\":\"JWT\"}"),
+      base64UrlEncode("{\"exp\":1000}"),
+      "untrusted-signature");
+
+    var proposalHandler = new SampleProposalHandler(signer);
+    var exception = assertThrows(
+      AccessDeniedException.class,
+      () -> proposalHandler.accept(expiredJwt));
+
+    assertTrue(exception.getMessage().contains("expired"));
+    assertTrue(exception.getMessage().contains("1 minute"));
+  }
+
+  @Test
+  public void accept_whenTokenNotExpiredButInvalid_thenThrowsGenericMessage() throws Exception {
+    var signer = Mockito.mock(TokenSigner.class);
+    when(signer.verify(anyString()))
+      .thenThrow(new TokenVerifier.VerificationException("Invalid signature"));
+
+    var unexpiredJwt = String.join(
+      ".",
+      base64UrlEncode("{\"alg\":\"RS256\",\"typ\":\"JWT\"}"),
+      base64UrlEncode(
+        "{\"exp\":" + Instant.now().plusSeconds(3600).getEpochSecond() + "}"),
+      "untrusted-signature");
+
+    var proposalHandler = new SampleProposalHandler(signer);
+    var exception = assertThrows(
+      AccessDeniedException.class,
+      () -> proposalHandler.accept(unexpiredJwt));
+
+    assertEquals("The proposal token is invalid", exception.getMessage());
+  }
+
+  @Test
+  public void accept_whenTokenMalformed_thenThrowsGenericMessage() throws Exception {
+    var signer = Mockito.mock(TokenSigner.class);
+    when(signer.verify(anyString()))
+      .thenThrow(new TokenVerifier.VerificationException("Token is expired"));
+
+    var proposalHandler = new SampleProposalHandler(signer);
+    var exception = assertThrows(
+      AccessDeniedException.class,
+      () -> proposalHandler.accept("not-a-jwt"));
+
+    assertEquals("The proposal token is invalid", exception.getMessage());
+  }
+
+  private static String base64UrlEncode(String json) {
+    return Base64.getUrlEncoder()
+      .withoutPadding()
+      .encodeToString(json.getBytes(StandardCharsets.UTF_8));
+  }
+
+  /**
+   * Approval must release the SECOP-1101 pending-request reservation
+   * (both key variants — the variant used at propose-time isn't encoded
+   * in the token) so the beneficiary can re-request the group without
+   * waiting out the token TTL.
+   */
+  @Test
+  public void accept_onCompletedReleasesReservationAndNotifies() throws Exception {
+    var released = new ArrayList<Boolean>();
+    var notified = new ArrayList<Proposal>();
+    var handler = new SampleProposalHandler(new PseudoSigner()) {
+      @Override
+      void releaseProposalReservation(
+        @NotNull Proposal proposal,
+        boolean reviewersAutoSelected
+      ) {
+        released.add(reviewersAutoSelected);
+      }
+
+      @Override
+      void onProposalApproved(
+        @NotNull JitGroupContext.ApprovalOperation operation,
+        @NotNull Proposal proposal
+      ) {
+        notified.add(proposal);
+      }
+    };
+
+    var token = "{\"rcp\":[\"user:user-2@example.com\"]," +
+      "\"grp\":\"jit-group:env.sys.group-1\"," +
+      "\"usr\":\"user:user-1@example.com\",\"inp\":{}}";
+    var proposal = handler.accept(token);
+    proposal.onCompleted(Mockito.mock(JitGroupContext.ApprovalOperation.class));
+
+    assertEquals(List.of(true, false), released);
+    assertEquals(List.of(proposal), notified);
   }
 
   /**

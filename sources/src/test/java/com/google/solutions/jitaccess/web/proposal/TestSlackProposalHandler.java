@@ -866,4 +866,38 @@ public class TestSlackProposalHandler {
       "registry must record one entry per reviewer regardless of "
         + "fan-out concurrency cap");
   }
+
+  // -------------------------------------------------------------------------
+  // releaseProposalReservation (SECOP-1101).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Approval releases both pending-key variants (the variant used at
+   * propose-time isn't recoverable from the token), so both must map to
+   * a registry release with the right key derivation.
+   */
+  @Test
+  public void releaseProposalReservation_releasesAutoAndPickedVariants() {
+    var registry = mock(SlackMessageRegistry.class);
+    when(registry.pendingKey(anyString(), anyString(), isNull()))
+      .thenReturn("pending-auto");
+    when(registry.pendingKey(anyString(), anyString(), anyList()))
+      .thenReturn("pending-picked");
+    when(registry.releasePendingProposal(anyString()))
+      .thenReturn(CompletableFuture.completedFuture(null));
+    var handler = newHandler(
+      slackClientHappyPath(), registry, groupResolverPassthrough());
+
+    var proposal = proposalFor(ALICE, Set.<IamPrincipalId>of(BOB));
+    handler.releaseProposalReservation(proposal, true);
+    handler.releaseProposalReservation(proposal, false);
+
+    verify(registry).pendingKey(
+      eq("alice@example.com"), eq(GROUP.toString()), isNull());
+    verify(registry).pendingKey(
+      eq("alice@example.com"), eq(GROUP.toString()),
+      eq(List.of("bob@example.com")));
+    verify(registry).releasePendingProposal(eq("pending-auto"));
+    verify(registry).releasePendingProposal(eq("pending-picked"));
+  }
 }

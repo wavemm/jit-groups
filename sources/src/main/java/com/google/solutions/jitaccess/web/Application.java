@@ -244,9 +244,9 @@ public class Application {
 
   @Produces
   public @NotNull LinkBuilder produceLinkBuilder() {
-    return uriInfo -> uriInfo
-      .getBaseUriBuilder()
-      .scheme(runtime.type() == ApplicationRuntime.Type.DEVELOPMENT
+    return new CanonicalLinkBuilder(
+      configuration.publicBaseUrl.orElse(null),
+      runtime.type() == ApplicationRuntime.Type.DEVELOPMENT
         ? "http"
         : "https");
   }
