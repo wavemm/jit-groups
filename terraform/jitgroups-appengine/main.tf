@@ -140,6 +140,16 @@ terraform {
     provider_meta "google" {
         module_name = "cloud-solutions/jitgroups-appengine-deploy-v2.0"
     }
+
+    required_version = ">= 1.7.0"
+
+    # Use pre-8.x provider to remove IAP branding resources.
+    required_providers {
+        google = {
+            source  = "hashicorp/google"
+            version = "< 8.0.0"
+        }
+    }
 }
 
 #------------------------------------------------------------------------------
@@ -252,35 +262,20 @@ resource "google_service_account_iam_member" "service_account_member" {
 # IAP.
 #------------------------------------------------------------------------------
 
-#
-# Create an OAuth consent screen for IAP.
-#
-resource "google_iap_brand" "iap_brand" {
-    depends_on                 = [ google_project_service.iap ]
-    project                    = var.project_id
-    support_email              = var.admin_email
-    application_title          = "JIT Groups"
+removed {
+    from = google_iap_brand.iap_brand
+
     lifecycle {
-        # Brands cannot be deleted or recreated (one per project, and the
-        # IAP OAuth Admin API is deprecated). A support_email change forces
-        # replacement, which first deletes the dependent IAP client and
-        # breaks all logins (2026-07-07 outage). Fail the plan instead.
-        prevent_destroy = true
+        destroy = false
     }
 }
 
-#
-# Create an OAuth client ID for IAP.
-#
-resource "google_iap_client" "iap_client" {
-    display_name               = "JIT Groups"
-    brand                      = google_iap_brand.iap_brand.name
+removed {
+    from = google_iap_client.iap_client
 
-    # Never delete the live OAuth client through the API: App Engine IAP
-    # keeps referencing it and every login fails with `deleted_client`
-    # (2026-07-07 outage). On destroy/replace, only remove it from state
-    # and leave the client running in GCP.
-    deletion_policy            = "ABANDON"
+    lifecycle {
+        destroy = false
+    }
 }
 
 #
@@ -340,10 +335,13 @@ resource "google_secret_manager_secret_iam_member" "secret_binding" {
 resource "google_app_engine_application" "appengine_app" {
     project                    = var.project_id
     location_id                = var.location
-    iap {
-        enabled                = true
-        oauth2_client_id       = google_iap_client.iap_client.client_id
-        oauth2_client_secret   = google_iap_client.iap_client.secret
+
+    lifecycle {
+        #
+        # IAP is managed outside of Terraform (via Google Cloud Console
+        # or gcloud) to use a Google-managed OAuth client.
+        #
+        ignore_changes         = [iap]
     }
 }
 
@@ -418,7 +416,7 @@ resource "google_app_engine_standard_app_version" "appengine_app_version" {
     version_id                 = "rev-${substr(data.archive_file.sources_zip.output_sha256, 0, 16)}"
     service                    = "default"
     project                    = var.project_id
-    runtime                    = "java17"
+    runtime                    = "java25"
     instance_class             = "F2"
     service_account            = google_service_account.jitgroups.email
     env_variables              = merge({
@@ -482,6 +480,7 @@ output "url" {
     description                = "URL to application"  
     value                      = "https://${google_app_engine_application.appengine_app.default_hostname}/"
 }
+
 output "service_account" {
     description                = "Service account used by the application"  
     value                      = google_service_account.jitgroups.email

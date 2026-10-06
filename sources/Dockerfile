@@ -22,7 +22,7 @@
 #
 # Build stage.
 #
-FROM maven:3.9.8-eclipse-temurin-22-alpine AS build
+FROM maven:3.9.15-eclipse-temurin-26-alpine AS build
 WORKDIR /app
 
 # Copy local code to the container image.
@@ -34,7 +34,7 @@ RUN mvn clean package -DskipTests -Dquarkus.package.output-name=jitaccess
 #
 # Package stage.
 #
-FROM gcr.io/distroless/java17-debian12
+FROM gcr.io/distroless/java25-debian13
 WORKDIR /app
 
 COPY --from=build /app/target/jitaccess-runner.jar .
