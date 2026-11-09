@@ -359,6 +359,16 @@ main .mdc-button {
 
 /* ==== Wavemm fork: reviewer picker + copy-link UI ==== */
 
+.jit-group-membership .mdc-list-item {
+    height: auto;
+}
+
+.jit-group-membership .mdc-list-item__secondary-text {
+    overflow: unset;
+    white-space: normal;
+    text-overflow: unset;
+}
+
 .jit-reviewer-picker {
     margin-top: 16px;
     padding: 12px 0;
